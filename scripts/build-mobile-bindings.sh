@@ -26,7 +26,11 @@ echo "== kotlin + swift bindings =="
 
 echo "== android native libraries =="
 : "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to an installed NDK}"
-cargo ndk "${ANDROID_TARGETS[@]/#/-t }" -o bindings/jniLibs \
+target_flags=()
+for abi in "${ANDROID_TARGETS[@]}"; do
+  target_flags+=(-t "$abi")
+done
+cargo ndk "${target_flags[@]}" -o bindings/jniLibs \
   build --release --features uniffi-bindings
 
 echo "done: bindings/{kotlin,swift,jniLibs}"
