@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: clippy,rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+      - run: cargo build --release --features uniffi-bindings
+      - run: >-
+          cargo run --features bindgen-cli --bin billsim-bindgen --
+          generate target/release/libbillsim.so
+          --language swift --out-dir target/generated/swift --no-format
+      - run: >-
+          cargo run --features bindgen-cli --bin billsim-bindgen --
+          generate target/release/libbillsim.so
+          --language kotlin --out-dir target/generated/kotlin --no-format
