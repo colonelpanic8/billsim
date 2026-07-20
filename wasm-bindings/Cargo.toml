@@ -1,0 +1,19 @@
+[package]
+name = "billsim-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "wasm-bindgen bindings for billsim (browser / React Native web)"
+license = "Apache-2.0"
+
+# Separate crate rather than a feature on billsim itself: billsim forbids
+# unsafe_code, which the #[wasm_bindgen] macro expansion violates.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+billsim = { path = ".." }
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true

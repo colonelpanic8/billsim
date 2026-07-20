@@ -10,11 +10,22 @@ pub mod ffi;
 pub mod math;
 pub mod model;
 pub mod physics;
+pub mod position;
 pub mod simulation;
 mod table;
 
-pub use aiming::{AimError, PotAim, compute_pot_aim};
-pub use ffi::{AimRequest, FfiError, SimulationRequest, compute_pot_aim_json, simulate_json};
+pub use aiming::{
+    AimError, PotAim, PotFeasibility, compute_pot_aim, compute_pot_aim_seeded,
+    geometric_pot_feasibility,
+};
+pub use ffi::{
+    AimRequest, FfiError, PositionRequest, SimulationRequest, compute_pot_aim_json, simulate_json,
+    suggest_position_shot_json,
+};
+pub use position::{
+    PositionError, PositionSearchConfig, PositionShotCandidate, PositionSuggestion,
+    suggest_position_shot,
+};
 
 #[cfg(feature = "uniffi-bindings")]
 uniffi::setup_scaffolding!();

@@ -20,6 +20,10 @@ homography and UI coordinate conversion remain consumer concerns.
 - dense trajectories, event history, final state, and potted-ball reporting;
 - jaw-aware geometric potting, cut angle, required precision, obstruction
   reporting, and simulation-refined spin/throw compensation;
+- a position-play search (`suggest_position_shot`): sweep speed/spin for
+  strikes that pot a target ball and leave the cue ball inside a target
+  polygon, ranked by speed tolerance and dwell, restricted to contact-clean
+  shots (the single cue -> target hit is the only ball-ball contact);
 - a serialization-first FFI contract exported through PyO3 and UniFFI; and
 - an optional Python adapter implementing Railbird's existing `ShotSimulator`
   protocol and pot-aim result shape.
@@ -36,8 +40,10 @@ cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-The primary APIs are `simulate` and `compute_pot_aim`. `simulate_json` and
-`compute_pot_aim_json` expose the same types as JSON for language boundaries.
+The primary APIs are `simulate`, `compute_pot_aim`, and
+`suggest_position_shot`. `simulate_json`, `compute_pot_aim_json`, and
+`suggest_position_shot_json` expose the same types as JSON for language
+boundaries.
 Input table and options objects support omitted fields through the documented
 Rust defaults. See [`docs/wire-format.md`](docs/wire-format.md) for JSON
 examples.
@@ -79,3 +85,18 @@ and the intended React Native/Nitro integration seam.
 ## License
 
 Apache-2.0. See [`NOTICE`](NOTICE) for Pooltool attribution.
+
+## WebAssembly
+
+`wasm-bindings/` is a thin `wasm-bindgen` wrapper crate (separate because
+billsim forbids `unsafe_code`, which the `#[wasm_bindgen]` expansion
+violates). It exports the three `*_json` functions for browsers and
+React Native web:
+
+```sh
+cd wasm-bindings
+wasm-pack build --target web --release
+```
+
+The full default position search (108 cells) runs in roughly 36 ms under
+Node's WASM runtime.

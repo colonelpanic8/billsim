@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::aiming::{PotAim, compute_pot_aim};
+use crate::math::Vec2;
 use crate::model::{BallId, PocketId, ShotProjection, SimulationOptions, SimulationScenario};
+use crate::position::{PositionSearchConfig, PositionSuggestion, suggest_position_shot};
 use crate::simulation::simulate;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -19,6 +21,17 @@ pub struct AimRequest {
     pub scenario: SimulationScenario,
     pub target_ball_id: BallId,
     pub pocket_id: PocketId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PositionRequest {
+    pub scenario: SimulationScenario,
+    pub target_ball_id: BallId,
+    pub pocket_id: PocketId,
+    /// Target-area polygon vertices in physics-frame meters.
+    pub target_area: Vec<Vec2>,
+    #[serde(default)]
+    pub config: Option<PositionSearchConfig>,
 }
 
 #[derive(Debug, Error)]
@@ -68,16 +81,47 @@ pub fn compute_pot_aim_json(request: String) -> Result<String, FfiError> {
     serde_json::to_string(&aim).map_err(|error| FfiError::ResponseEncoding(error.to_string()))
 }
 
+/// Search for a position-play strike through the cross-language JSON
+/// contract: pot `target_ball_id` into `pocket_id` and leave the cue ball
+/// inside `target_area`.
+///
+/// # Errors
+///
+/// Returns [`FfiError`] when the request cannot be decoded, the search
+/// fails, or the response cannot be encoded.
+#[cfg_attr(feature = "uniffi-bindings", uniffi::export)]
+#[allow(clippy::needless_pass_by_value)] // UniFFI owns exported strings.
+pub fn suggest_position_shot_json(request: String) -> Result<String, FfiError> {
+    let request: PositionRequest = serde_json::from_str(&request)
+        .map_err(|error| FfiError::InvalidRequest(error.to_string()))?;
+    let suggestion: PositionSuggestion = suggest_position_shot(
+        &request.scenario,
+        request.target_ball_id,
+        request.pocket_id,
+        &request.target_area,
+        request.config,
+    )
+    .map_err(|error| FfiError::Aim(error.to_string()))?;
+    serde_json::to_string(&suggestion)
+        .map_err(|error| FfiError::ResponseEncoding(error.to_string()))
+}
+
 #[cfg(feature = "python")]
 mod python {
     use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
 
-    use super::{compute_pot_aim_json, simulate_json};
+    use super::{compute_pot_aim_json, simulate_json, suggest_position_shot_json};
 
     #[pyfunction(name = "simulate_json")]
     fn py_simulate_json(request: String) -> PyResult<String> {
         simulate_json(request).map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    #[pyfunction(name = "suggest_position_shot_json")]
+    fn py_suggest_position_shot_json(request: String) -> PyResult<String> {
+        suggest_position_shot_json(request)
+            .map_err(|error| PyValueError::new_err(error.to_string()))
     }
 
     #[pyfunction(name = "compute_pot_aim_json")]
@@ -89,6 +133,7 @@ mod python {
     fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.add_function(wrap_pyfunction!(py_simulate_json, module)?)?;
         module.add_function(wrap_pyfunction!(py_compute_pot_aim_json, module)?)?;
+        module.add_function(wrap_pyfunction!(py_suggest_position_shot_json, module)?)?;
         Ok(())
     }
 }

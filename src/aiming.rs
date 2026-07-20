@@ -73,6 +73,36 @@ struct Jaw {
     corner: bool,
 }
 
+/// Geometry-only pot viability: occlusion and cut-angle, no simulations.
+///
+/// Callers that would otherwise run a simulation search (for example the
+/// position sweep) should consult this first — solving aim for an
+/// impossible pot degenerates into the solver's worst case on every probe.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PotFeasibility {
+    pub feasible: bool,
+    pub occluding_ball_ids: Vec<BallId>,
+    pub cut_angle: f64,
+}
+
+/// Report whether a direct pot is geometrically on, using no simulations.
+///
+/// # Errors
+///
+/// Returns [`AimError`] for an invalid target or degenerate geometry.
+pub fn geometric_pot_feasibility(
+    scenario: &SimulationScenario,
+    target_ball_id: BallId,
+    pocket_id: PocketId,
+) -> Result<PotFeasibility, AimError> {
+    let (_, _, setup) = pot_setup(scenario, target_ball_id, pocket_id)?;
+    Ok(PotFeasibility {
+        feasible: setup.feasible,
+        occluding_ball_ids: setup.occluding_ball_ids,
+        cut_angle: setup.cut_angle,
+    })
+}
+
 /// Compute a Pooltool-compatible pot aim in physics-frame degrees.
 ///
 /// The scenario's `strike.phi` is ignored. Speed, elevation, side spin, and
@@ -87,6 +117,24 @@ pub fn compute_pot_aim(
     target_ball_id: BallId,
     pocket_id: PocketId,
 ) -> Result<PotAim, AimError> {
+    compute_pot_aim_seeded(scenario, target_ball_id, pocket_id, None)
+}
+
+struct PotSetup {
+    pocket: Pocket,
+    potting_point: Vec2,
+    geometric_phi: f64,
+    cut_angle: f64,
+    required_precision: f64,
+    occluding_ball_ids: Vec<BallId>,
+    feasible: bool,
+}
+
+fn pot_setup(
+    scenario: &SimulationScenario,
+    target_ball_id: BallId,
+    pocket_id: PocketId,
+) -> Result<(Vec2, Vec2, PotSetup), AimError> {
     if target_ball_id == scenario.cue_ball_id {
         return Err(AimError::CueBallIsTarget);
     }
@@ -127,23 +175,56 @@ pub fn compute_pot_aim(
         potting_point,
     );
     let feasible = occluding_ball_ids.is_empty() && cut_angle.abs() <= MAX_CUT_ANGLE;
+    Ok((
+        cue.position,
+        target.position,
+        PotSetup {
+            pocket,
+            potting_point,
+            geometric_phi,
+            cut_angle,
+            required_precision,
+            occluding_ball_ids,
+            feasible,
+        },
+    ))
+}
+
+/// [`compute_pot_aim`] with an optional warm-start seed for the refinement.
+///
+/// `seed_phi` (physics-frame degrees) replaces the geometric seed as the
+/// starting point of the secant search — useful when solving a family of
+/// similar strikes, where the previous solution is a near-answer. The
+/// geometric aim is still computed and reported unchanged.
+///
+/// # Errors
+///
+/// Returns [`AimError`] for an invalid target, degenerate geometry, or a
+/// failed simulation probe.
+pub fn compute_pot_aim_seeded(
+    scenario: &SimulationScenario,
+    target_ball_id: BallId,
+    pocket_id: PocketId,
+    seed_phi: Option<f64>,
+) -> Result<PotAim, AimError> {
+    let (_, _, setup) = pot_setup(scenario, target_ball_id, pocket_id)?;
     let (solution, converged) = solve(
         scenario,
         target_ball_id,
-        pocket,
-        potting_point,
-        geometric_phi,
+        setup.pocket,
+        setup.potting_point,
+        seed_phi.unwrap_or(setup.geometric_phi),
     )?;
 
     Ok(PotAim {
         phi: solution.phi.rem_euclid(360.0),
-        geometric_phi: geometric_phi.rem_euclid(360.0),
-        cut_angle,
-        required_precision,
-        feasible,
+        geometric_phi: setup.geometric_phi.rem_euclid(360.0),
+        cut_angle: setup.cut_angle,
+        required_precision: setup.required_precision,
+        feasible: setup.feasible,
         potted: solution.potted,
         converged,
-        occluding_ball_ids,
+        occluding_ball_ids: setup.occluding_ball_ids,
     })
 }
 
