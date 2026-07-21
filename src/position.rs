@@ -353,6 +353,8 @@ type GridKey = (usize, usize);
 /// Returns [`PositionError`] for a degenerate polygon or a failed aim
 /// solve / simulation inside the sweep.
 #[allow(clippy::too_many_lines)] // The sweep/rank/select pipeline reads best unsplit.
+type RankedCell = ((f64, u32, f64), usize, GridKey);
+
 pub fn suggest_position_shot(
     scenario: &SimulationScenario,
     target_ball_id: BallId,
@@ -466,7 +468,6 @@ pub fn suggest_position_shot(
     // identity — the success region is usually one connected blob — so
     // grouping by route is what surfaces "the follow route vs the
     // two-rail draw route" as real options.
-    type RankedCell = ((f64, u32, f64), usize, GridKey);
     let winner_signature = {
         let grid = &slices[winner.0].1;
         route_signature(&grid[winner.1.0][winner.1.1])
