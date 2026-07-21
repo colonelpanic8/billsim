@@ -55,8 +55,9 @@ pub struct PositionSearchConfig {
 /// (in-area length of the arrival path — how long the stop position stays
 /// viable) are the primary benefits. Everything that makes a shot harder
 /// to execute — hitting harder, longer cue travel, spin (side spin
-/// costing more than follow/draw), and every cushion the cue takes —
-/// counts against it.
+/// costing most, then draw, then follow), and every cushion the cue
+/// takes (mildly — cushion routes are normal position play) — counts
+/// against it.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub struct ScoringWeights {
@@ -66,7 +67,8 @@ pub struct ScoringWeights {
     pub speed: f64,
     pub travel: f64,
     pub side_spin: f64,
-    pub vertical_spin: f64,
+    pub follow_spin: f64,
+    pub draw_spin: f64,
     pub cushion: f64,
 }
 
@@ -79,8 +81,9 @@ impl Default for ScoringWeights {
             speed: 0.8,
             travel: 0.7,
             side_spin: 0.7,
-            vertical_spin: 0.35,
-            cushion: 0.5,
+            follow_spin: 0.3,
+            draw_spin: 0.55,
+            cushion: 0.25,
         }
     }
 }
@@ -625,12 +628,17 @@ fn cue_path(
     for event in &projection.events {
         if event.ball_ids.contains(&scenario.cue_ball_id)
             && let Some(position) = event.position
-            && path.last().is_none_or(|last| (*last - position).norm() > 1e-9)
+            && path
+                .last()
+                .is_none_or(|last| (*last - position).norm() > 1e-9)
         {
             path.push(position);
         }
     }
-    if path.last().is_none_or(|last| (*last - cue_final).norm() > 1e-9) {
+    if path
+        .last()
+        .is_none_or(|last| (*last - cue_final).norm() > 1e-9)
+    {
         path.push(cue_final);
     }
     path
@@ -770,13 +778,19 @@ impl ScoringContext {
         let travel_n = (cell.travel / (2.0 * self.table_length)).min(1.0);
         let side_spin_n = (cell.a.abs() / MAX_SPIN_OFFSET).min(1.0);
         let vertical_spin_n = (cell.b.abs() / MAX_SPIN_OFFSET).min(1.0);
+        // Draw is harder to execute than follow; each gets its own weight.
+        let vertical_weight = if cell.b < 0.0 {
+            self.weights.draw_spin
+        } else {
+            self.weights.follow_spin
+        };
         let cushion_n = (f64::from(cell.cushions) / 3.0).min(1.0);
         let weights = &self.weights;
         weights.speed_window * window_n + weights.dwell * dwell_n + weights.depth * depth_n
             - weights.speed * speed_n
             - weights.travel * travel_n
             - weights.side_spin * side_spin_n
-            - weights.vertical_spin * vertical_spin_n
+            - vertical_weight * vertical_spin_n
             - weights.cushion * cushion_n
     }
 }
@@ -1025,11 +1039,15 @@ mod tests {
 
         let mut side_spun = base.clone();
         side_spun.a = 0.5;
+        let mut followed = base.clone();
+        followed.b = 0.5;
         let mut drawn = base.clone();
-        drawn.b = 0.5;
+        drawn.b = -0.5;
         assert!(context.score(&side_spun, 2) < context.score(&base, 2));
+        assert!(context.score(&followed, 2) < context.score(&base, 2));
         assert!(context.score(&drawn, 2) < context.score(&base, 2));
-        // Side spin costs more than the same amount of follow/draw.
+        // Execution difficulty ordering: side spin > draw > follow.
+        assert!(context.score(&drawn, 2) < context.score(&followed, 2));
         assert!(context.score(&side_spun, 2) < context.score(&drawn, 2));
 
         let mut banked = base.clone();
