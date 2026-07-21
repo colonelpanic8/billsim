@@ -32,7 +32,10 @@
             "rustc"
             "rustfmt"
           ])
+          fenixPkgs.targets.aarch64-linux-android.stable.rust-std
+          fenixPkgs.targets.armv7-linux-androideabi.stable.rust-std
           fenixPkgs.targets.wasm32-unknown-unknown.stable.rust-std
+          fenixPkgs.targets.x86_64-linux-android.stable.rust-std
         ];
         rustPlatform = pkgs.makeRustPlatform {
           cargo = rustToolchain;
