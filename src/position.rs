@@ -19,7 +19,7 @@
 //! *dwell* — the in-polygon length of the cue ball's final straight
 //! approach — then on depth inside the polygon.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -194,7 +194,8 @@ pub struct PositionSuggestion {
     pub achievable: bool,
     /// `None` only if no grid point pots cleanly.
     pub best: Option<PositionShotCandidate>,
-    /// Up to 2, from distinct successful regions.
+    /// Up to 3 — the best cell of each distinct route (spin family +
+    /// rail sequence) other than the winner's.
     pub alternates: Vec<PositionShotCandidate>,
     pub evaluated_count: u32,
     pub successful_count: u32,
@@ -317,6 +318,10 @@ struct Cell {
     /// geometry of the post-shot layout, which is exactly known because
     /// contact-clean shots move nothing but the target.
     next_shot_quality: f64,
+    /// The cue ball's route: rail contacts in order (consecutive
+    /// duplicates collapsed), in player terms — the six rails of the
+    /// table, not pooltool's 30 cushion segments.
+    route: Vec<&'static str>,
     /// Any ball-ball contact beyond the single cue -> target hit.
     secondary_contact: bool,
 }
@@ -455,26 +460,37 @@ pub fn suggest_position_shot(
         }
     }
 
-    // Alternates come from distinct connected components of the success
-    // region (per slice, 8-connectivity), the winner's excluded, so they
-    // represent genuinely different ways to play the position.
-    let mut alternate_entries: Vec<((f64, u32, f64), usize, GridKey)> = Vec::new();
-    for (slice_index, (_, grid)) in slices.iter().enumerate() {
-        for component in successful_components(grid) {
-            if slice_index == winner.0 && component.contains(&winner.1) {
-                continue;
-            }
-            if let Some(&best_key) = component.iter().max_by(|&&lhs, &&rhs| {
-                let lhs_rank = rank(slice_index, lhs);
-                let rhs_rank = rank(slice_index, rhs);
-                lhs_rank
-                    .partial_cmp(&rhs_rank)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }) {
-                alternate_entries.push((rank(slice_index, best_key), slice_index, best_key));
-            }
+    // Alternates are genuinely different *shots*: distinct route
+    // signatures (spin family + the ordered rails the cue ball takes),
+    // the winner's excluded. Parameter-space adjacency is not shot
+    // identity — the success region is usually one connected blob — so
+    // grouping by route is what surfaces "the follow route vs the
+    // two-rail draw route" as real options.
+    type RankedCell = ((f64, u32, f64), usize, GridKey);
+    let winner_signature = {
+        let grid = &slices[winner.0].1;
+        route_signature(&grid[winner.1.0][winner.1.1])
+    };
+    let mut best_per_route: std::collections::BTreeMap<String, RankedCell> =
+        std::collections::BTreeMap::new();
+    for &(slice_index, key) in &successful {
+        let cell = &slices[slice_index].1[key.0][key.1];
+        let signature = route_signature(cell);
+        if signature == winner_signature {
+            continue;
+        }
+        let candidate_rank = rank(slice_index, key);
+        let entry = best_per_route
+            .entry(signature)
+            .or_insert((candidate_rank, slice_index, key));
+        if candidate_rank
+            .partial_cmp(&entry.0)
+            .is_some_and(std::cmp::Ordering::is_gt)
+        {
+            *entry = (candidate_rank, slice_index, key);
         }
     }
+    let mut alternate_entries: Vec<RankedCell> = best_per_route.into_values().collect();
     alternate_entries.sort_by(|lhs, rhs| {
         rhs.0
             .partial_cmp(&lhs.0)
@@ -497,7 +513,7 @@ pub fn suggest_position_shot(
 
     let best = realize(winner.0, winner.1)?;
     let mut alternates = Vec::new();
-    for &(_, slice_index, key) in alternate_entries.iter().take(2) {
+    for &(_, slice_index, key) in alternate_entries.iter().take(3) {
         alternates.push(realize(slice_index, key)?);
     }
 
@@ -576,6 +592,7 @@ fn evaluate_slice(
                     travel: 0.0,
                     cushions: 0,
                     next_shot_quality: 0.0,
+                    route: Vec::new(),
                     secondary_contact: false,
                 });
             }
@@ -629,17 +646,23 @@ fn forward_simulate(
         .windows(2)
         .map(|pair| (pair[1] - pair[0]).norm())
         .sum::<f64>();
-    let cushions = u32::try_from(
-        projection
-            .events
-            .iter()
-            .filter(|event| {
-                event.event_type == SimulationEventType::BallCushion
-                    && event.ball_ids.contains(&scenario.cue_ball_id)
-            })
-            .count(),
-    )
-    .unwrap_or(u32::MAX);
+    let mut route: Vec<&'static str> = Vec::new();
+    let mut cushions = 0u32;
+    for event in &projection.events {
+        if event.event_type == SimulationEventType::BallCushion
+            && event.ball_ids.contains(&scenario.cue_ball_id)
+        {
+            cushions = cushions.saturating_add(1);
+            if let Some(position) = event.position {
+                let rail = rail_label(position, &scenario.table);
+                // Jaw rattles register several contacts on one rail; a
+                // route counts that as one visit.
+                if route.last() != Some(&rail) {
+                    route.push(rail);
+                }
+            }
+        }
+    }
     Ok(Cell {
         speed: scenario.strike.speed,
         phi: scenario.strike.phi,
@@ -655,8 +678,65 @@ fn forward_simulate(
         travel,
         cushions,
         next_shot_quality,
+        route,
         secondary_contact: !clean,
     })
+}
+
+/// Classify a cushion contact into the six rails players count: the two
+/// short rails and the four long-rail halves either side of the side
+/// pockets. Physics frame: x spans the short dimension, y the long one.
+fn rail_label(position: Vec2, table: &crate::model::TableSpec) -> &'static str {
+    let w = table.width;
+    let l = table.length;
+    let distances = [
+        (position.y, "bottom"),
+        (l - position.y, "top"),
+        (position.x, "left"),
+        (w - position.x, "right"),
+    ];
+    let side = distances
+        .iter()
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .map_or("left", |entry| entry.1);
+    match side {
+        "bottom" => "bottom",
+        "top" => "top",
+        "left" => {
+            if position.y < l / 2.0 {
+                "left_low"
+            } else {
+                "left_high"
+            }
+        }
+        _ => {
+            if position.y < l / 2.0 {
+                "right_low"
+            } else {
+                "right_high"
+            }
+        }
+    }
+}
+
+/// Spin family in player terms; thresholds match the client's labels.
+fn spin_family(b: f64) -> &'static str {
+    if b > 0.08 {
+        "follow"
+    } else if b < -0.08 {
+        "draw"
+    } else {
+        "stun"
+    }
+}
+
+/// Two cells are the same *shot* when they share a route signature: the
+/// spin family plus the ordered rails the cue ball takes. Adjacency in
+/// (speed, spin) parameter space says nothing about shot identity — the
+/// success region is usually one connected blob — but the route is how a
+/// player would name the shot.
+fn route_signature(cell: &Cell) -> String {
+    format!("{}|{}", spin_family(cell.b), cell.route.join(">"))
 }
 
 /// A pot precision window (degrees) at least this wide counts as a fully
@@ -936,46 +1016,6 @@ impl ScoringContext {
 /// against it.
 const MAX_SPIN_OFFSET: f64 = 0.85;
 
-/// Connected components (8-connectivity) of successful grid cells.
-fn successful_components(grid: &[Vec<Cell>]) -> Vec<BTreeSet<GridKey>> {
-    let mut unvisited: BTreeSet<GridKey> = grid
-        .iter()
-        .enumerate()
-        .flat_map(|(v, row)| {
-            row.iter()
-                .enumerate()
-                .filter_map(move |(b, cell)| cell.successful().then_some((v, b)))
-        })
-        .collect();
-    let mut components = Vec::new();
-    while let Some(&start) = unvisited.iter().next() {
-        unvisited.remove(&start);
-        let mut component = BTreeSet::from([start]);
-        let mut frontier = VecDeque::from([start]);
-        while let Some((v, b)) = frontier.pop_front() {
-            for dv in -1i64..=1 {
-                for db in -1i64..=1 {
-                    if dv == 0 && db == 0 {
-                        continue;
-                    }
-                    let Ok(nv) = usize::try_from(i64::try_from(v).unwrap_or(i64::MAX) + dv) else {
-                        continue;
-                    };
-                    let Ok(nb) = usize::try_from(i64::try_from(b).unwrap_or(i64::MAX) + db) else {
-                        continue;
-                    };
-                    if unvisited.remove(&(nv, nb)) {
-                        component.insert((nv, nb));
-                        frontier.push_back((nv, nb));
-                    }
-                }
-            }
-        }
-        components.push(component);
-    }
-    components
-}
-
 /// No grid point succeeded: report the closest clean pot, if any.
 ///
 /// "Clean" holds the best-effort fallback to the same contact standard as
@@ -1068,6 +1108,7 @@ mod tests {
             travel: 0.0,
             cushions: 0,
             next_shot_quality: 0.0,
+            route: Vec::new(),
             secondary_contact: false,
         }
     }
@@ -1148,15 +1189,47 @@ mod tests {
     }
 
     #[test]
-    fn components_split_disconnected_regions() {
-        // Two successes separated by a failure column are distinct
-        // components under 8-connectivity.
-        let mut grid: Vec<Vec<Cell>> = (0..1)
-            .map(|_| (0..5).map(|_| cell(false)).collect())
-            .collect();
-        grid[0][0] = cell(true);
-        grid[0][4] = cell(true);
-        assert_eq!(successful_components(&grid).len(), 2);
+    fn route_signature_distinguishes_routes_and_spin() {
+        let mut follow_one_rail = cell(true);
+        follow_one_rail.b = 0.4;
+        follow_one_rail.route = vec!["top"];
+        let mut draw_one_rail = cell(true);
+        draw_one_rail.b = -0.4;
+        draw_one_rail.route = vec!["top"];
+        let mut follow_two_rails = cell(true);
+        follow_two_rails.b = 0.4;
+        follow_two_rails.route = vec!["top", "right_high"];
+        assert_ne!(
+            route_signature(&follow_one_rail),
+            route_signature(&draw_one_rail)
+        );
+        assert_ne!(
+            route_signature(&follow_one_rail),
+            route_signature(&follow_two_rails)
+        );
+        // Same family + same rails = the same shot, whatever the params.
+        let mut same = follow_one_rail.clone();
+        same.speed = 3.9;
+        assert_eq!(route_signature(&follow_one_rail), route_signature(&same));
+    }
+
+    #[test]
+    fn rail_label_classifies_the_six_rails() {
+        let table = crate::model::TableSpec::default();
+        let l = table.length;
+        let w = table.width;
+        assert_eq!(rail_label(Vec2::new(w / 2.0, 0.01), &table), "bottom");
+        assert_eq!(rail_label(Vec2::new(w / 2.0, l - 0.01), &table), "top");
+        assert_eq!(rail_label(Vec2::new(0.01, l * 0.25), &table), "left_low");
+        assert_eq!(rail_label(Vec2::new(0.01, l * 0.75), &table), "left_high");
+        assert_eq!(
+            rail_label(Vec2::new(w - 0.01, l * 0.25), &table),
+            "right_low"
+        );
+        assert_eq!(
+            rail_label(Vec2::new(w - 0.01, l * 0.75), &table),
+            "right_high"
+        );
     }
 
     fn scoring_context() -> ScoringContext {
