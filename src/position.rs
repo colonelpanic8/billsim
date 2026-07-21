@@ -43,6 +43,46 @@ pub struct PositionSearchConfig {
     pub b_values: Vec<f64>,
     pub a_values: Vec<f64>,
     pub fallback_a_values: Vec<f64>,
+    pub scoring: ScoringWeights,
+}
+
+/// Weights for ranking successful leaves. The score is benefits minus
+/// penalties over normalized terms; hard requirements (potted, contact
+/// clean, no scratch, inside the polygon) are filters, not weights.
+///
+/// Rationale: human execution error is dominated by speed, so the speed
+/// window (contiguous speed steps that also succeed) and terminal dwell
+/// (in-area length of the arrival path — how long the stop position stays
+/// viable) are the primary benefits. Everything that makes a shot harder
+/// to execute — hitting harder, longer cue travel, spin (side spin
+/// costing more than follow/draw), and every cushion the cue takes —
+/// counts against it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ScoringWeights {
+    pub speed_window: f64,
+    pub dwell: f64,
+    pub depth: f64,
+    pub speed: f64,
+    pub travel: f64,
+    pub side_spin: f64,
+    pub vertical_spin: f64,
+    pub cushion: f64,
+}
+
+impl Default for ScoringWeights {
+    fn default() -> Self {
+        Self {
+            speed_window: 3.0,
+            dwell: 1.2,
+            depth: 0.4,
+            speed: 0.8,
+            travel: 0.7,
+            side_spin: 0.7,
+            vertical_spin: 0.35,
+            cushion: 0.5,
+        }
+    }
 }
 
 fn linspace(start: f64, end: f64, count: usize) -> Vec<f64> {
@@ -64,6 +104,7 @@ impl Default for PositionSearchConfig {
             b_values: linspace(-0.85, 0.85, 9),
             a_values: vec![0.0],
             fallback_a_values: vec![-0.5, 0.5],
+            scoring: ScoringWeights::default(),
         }
     }
 }
@@ -87,9 +128,16 @@ pub struct PositionShotCandidate {
     /// shot's speed tolerance. Includes this cell, so >= 1 for any
     /// successful candidate.
     pub robustness: u32,
-    /// In-polygon length (meters) of the cue ball's final straight
-    /// approach segment before stopping.
+    /// In-polygon length (meters) of the cue ball's terminal approach —
+    /// the contiguous tail of its path that ends at rest inside the area.
     pub dwell: f64,
+    /// Heuristic desirability of this leave (benefits minus penalties;
+    /// see [`ScoringWeights`]). Comparable only within one search.
+    pub score: f64,
+    /// Total distance (meters) the cue ball travels before resting.
+    pub cue_travel_distance: f64,
+    /// Cushions the cue ball contacts on its way to rest.
+    pub cue_cushion_count: u32,
     /// Target ball potted in the requested pocket.
     pub potted: bool,
     /// Cue ball pocketed.
@@ -204,10 +252,6 @@ pub fn segment_dwell(start: Vec2, end: Vec2, polygon: &[Vec2]) -> f64 {
     length * f64::from(inside) / f64::from(DWELL_SAMPLES)
 }
 
-/// A ball whose last pre-rest event position moved less than this (meters)
-/// is treated as never having moved for dwell purposes.
-const DWELL_EPSILON: f64 = 1e-9;
-
 // The outcome flags are the domain shape of a swept cell, not a state
 // machine to be refactored away.
 #[allow(clippy::struct_excessive_bools)]
@@ -224,6 +268,8 @@ struct Cell {
     in_target_area: bool,
     boundary_distance: f64,
     dwell: f64,
+    travel: f64,
+    cushions: u32,
     /// Any ball-ball contact beyond the single cue -> target hit.
     secondary_contact: bool,
 }
@@ -338,16 +384,18 @@ pub fn suggest_position_shot(
         ));
     }
 
-    // Rank every successful cell by its speed window (contiguous speed
-    // steps at the same spin that also succeed), tie-broken by dwell then
-    // by depth inside the polygon.
-    let rank = |slice_index: usize, key: GridKey| -> (u32, f64, f64) {
+    // Rank every successful cell by its heuristic leave score (see
+    // ScoringWeights); the speed window feeds the score as its dominant
+    // benefit. Ties break on (window, dwell) for determinism.
+    let scoring_context = ScoringContext::new(&config, scenario.table.length);
+    let rank = |slice_index: usize, key: GridKey| -> (f64, u32, f64) {
         let grid = &slices[slice_index].1;
         let cell = &grid[key.0][key.1];
-        (speed_window(grid, key), cell.dwell, cell.boundary_distance)
+        let window = speed_window(grid, key);
+        (scoring_context.score(cell, window), window, cell.dwell)
     };
-    let better = |lhs: (u32, f64, f64), rhs: (u32, f64, f64)| -> bool {
-        (lhs.0, lhs.1, lhs.2) > (rhs.0, rhs.1, rhs.2)
+    let better = |lhs: (f64, u32, f64), rhs: (f64, u32, f64)| -> bool {
+        lhs.partial_cmp(&rhs) == Some(std::cmp::Ordering::Greater)
     };
 
     let mut winner = successful[0];
@@ -363,7 +411,7 @@ pub fn suggest_position_shot(
     // Alternates come from distinct connected components of the success
     // region (per slice, 8-connectivity), the winner's excluded, so they
     // represent genuinely different ways to play the position.
-    let mut alternate_entries: Vec<((u32, f64, f64), usize, GridKey)> = Vec::new();
+    let mut alternate_entries: Vec<((f64, u32, f64), usize, GridKey)> = Vec::new();
     for (slice_index, (_, grid)) in slices.iter().enumerate() {
         for component in successful_components(grid) {
             if slice_index == winner.0 && component.contains(&winner.1) {
@@ -391,9 +439,11 @@ pub fn suggest_position_shot(
         |slice_index: usize, key: GridKey| -> Result<PositionShotCandidate, PositionError> {
             let grid = &slices[slice_index].1;
             let cell = &grid[key.0][key.1];
+            let window = speed_window(grid, key);
             Ok(to_candidate(
                 cell,
-                speed_window(grid, key),
+                window,
+                scoring_context.score(cell, window),
                 Some(project(scenario, cell)?),
             ))
         };
@@ -476,6 +526,8 @@ fn evaluate_slice(
                     in_target_area: false,
                     boundary_distance: distance_to_polygon_boundary(cue_start, polygon),
                     dwell: 0.0,
+                    travel: 0.0,
+                    cushions: 0,
                     secondary_contact: false,
                 });
             }
@@ -515,6 +567,22 @@ fn forward_simulate(
         .map(|state| state.position)
         .unwrap_or_default();
     let in_target_area = point_in_polygon(cue_final, polygon);
+    let path = cue_path(&projection, scenario, cue_final);
+    let travel = path
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).norm())
+        .sum::<f64>();
+    let cushions = u32::try_from(
+        projection
+            .events
+            .iter()
+            .filter(|event| {
+                event.event_type == SimulationEventType::BallCushion
+                    && event.ball_ids.contains(&scenario.cue_ball_id)
+            })
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
     Ok(Cell {
         speed: scenario.strike.speed,
         phi: scenario.strike.phi,
@@ -526,13 +594,76 @@ fn forward_simulate(
         scratched: ball_pocketed(&projection, scenario.cue_ball_id),
         in_target_area,
         boundary_distance: distance_to_polygon_boundary(cue_final, polygon),
-        dwell: final_approach_dwell(&projection, scenario.cue_ball_id, cue_final, polygon),
+        dwell: terminal_dwell(&path, polygon),
+        travel,
+        cushions,
         secondary_contact: !sole_contact_is_cue_target(
             &projection,
             scenario.cue_ball_id,
             target_ball_id,
         ),
     })
+}
+
+/// The cue ball's path as a polyline: its start position, its position at
+/// every event it participates in, and its rest position. Segments
+/// between events are treated as straight (curved sliding is slightly
+/// under-measured, which is fine for scoring).
+fn cue_path(
+    projection: &ShotProjection,
+    scenario: &SimulationScenario,
+    cue_final: Vec2,
+) -> Vec<Vec2> {
+    let mut path: Vec<Vec2> = Vec::new();
+    if let Some(start) = scenario
+        .balls
+        .iter()
+        .find(|ball| ball.id == scenario.cue_ball_id)
+    {
+        path.push(start.position);
+    }
+    for event in &projection.events {
+        if event.ball_ids.contains(&scenario.cue_ball_id)
+            && let Some(position) = event.position
+            && path.last().is_none_or(|last| (*last - position).norm() > 1e-9)
+        {
+            path.push(position);
+        }
+    }
+    if path.last().is_none_or(|last| (*last - cue_final).norm() > 1e-9) {
+        path.push(cue_final);
+    }
+    path
+}
+
+/// In-polygon length of the path's terminal tail: walking backward from
+/// rest, accumulate arc length while samples stay inside the polygon and
+/// stop at the first sample outside. This is the stretch over which a
+/// speed error still leaves the cue ball in the target area.
+fn terminal_dwell(path: &[Vec2], polygon: &[Vec2]) -> f64 {
+    let mut dwell = 0.0;
+    'segments: for pair in path.windows(2).rev() {
+        let (start, end) = (pair[0], pair[1]);
+        let length = (end - start).norm();
+        if length == 0.0 {
+            continue;
+        }
+        let step = length / f64::from(DWELL_SAMPLES);
+        // Sample from the rest-side end backward toward the segment start.
+        for index in 0..DWELL_SAMPLES {
+            let t = 1.0 - (f64::from(index) + 0.5) / f64::from(DWELL_SAMPLES);
+            let sample = Vec2::new(
+                start.x + t * (end.x - start.x),
+                start.y + t * (end.y - start.y),
+            );
+            if point_in_polygon(sample, polygon) {
+                dwell += step;
+            } else {
+                break 'segments;
+            }
+        }
+    }
+    dwell
 }
 
 fn potted_in_pocket(projection: &ShotProjection, ball_id: BallId, pocket_id: PocketId) -> bool {
@@ -579,30 +710,6 @@ fn sole_contact_is_cue_target(
     contact_count == 1
 }
 
-/// In-polygon length of the cue ball's final approach segment.
-///
-/// The sweep runs without dense trajectories, so the approach start is the
-/// cue ball's position at its last recorded event before rest (the final
-/// rolling phase is straight; earlier curvature is deliberately ignored).
-fn final_approach_dwell(
-    projection: &ShotProjection,
-    cue_ball_id: BallId,
-    cue_final: Vec2,
-    polygon: &[Vec2],
-) -> f64 {
-    let start = projection
-        .events
-        .iter()
-        .rev()
-        .filter(|event| event.ball_ids.contains(&cue_ball_id))
-        .filter_map(|event| event.position)
-        .find(|position| (*position - cue_final).norm() > DWELL_EPSILON);
-    match start {
-        Some(start) => segment_dwell(start, cue_final, polygon),
-        None => 0.0,
-    }
-}
-
 /// Length of the contiguous successful run along the speed axis through
 /// `key`, counting `key` itself.
 fn speed_window(grid: &[Vec<Cell>], key: GridKey) -> u32 {
@@ -620,6 +727,63 @@ fn speed_window(grid: &[Vec<Cell>], key: GridKey) -> u32 {
     }
     count
 }
+
+/// Normalization context for scoring: saturation scales derived from the
+/// sweep configuration and table so every term lands in roughly [0, 1]
+/// before weighting.
+struct ScoringContext {
+    weights: ScoringWeights,
+    max_speed: f64,
+    max_window: f64,
+    table_length: f64,
+}
+
+impl ScoringContext {
+    fn new(config: &PositionSearchConfig, table_length: f64) -> Self {
+        Self {
+            weights: config.scoring.clone(),
+            max_speed: config
+                .speed_values
+                .iter()
+                .copied()
+                .fold(f64::EPSILON, f64::max),
+            #[allow(clippy::cast_precision_loss)]
+            max_window: config.speed_values.len().max(1) as f64,
+            table_length: table_length.max(f64::EPSILON),
+        }
+    }
+
+    /// Heuristic desirability of a successful leave: benefits (speed
+    /// window, terminal dwell, depth in the area) minus penalties (strike
+    /// speed, cue travel, spin — side spin weighted heavier than
+    /// follow/draw — and cushions). Saturations: dwell at half a table
+    /// length, depth at 0.3 m, travel at two table lengths, cushions at 3.
+    fn score(&self, cell: &Cell, window: u32) -> f64 {
+        let window_n = (f64::from(window) - 1.0).max(0.0) / (self.max_window - 1.0).max(1.0);
+        let dwell_n = (cell.dwell / (0.5 * self.table_length)).min(1.0);
+        let depth_n = if cell.in_target_area {
+            (cell.boundary_distance / 0.3).min(1.0)
+        } else {
+            0.0
+        };
+        let speed_n = (cell.speed / self.max_speed).min(1.0);
+        let travel_n = (cell.travel / (2.0 * self.table_length)).min(1.0);
+        let side_spin_n = (cell.a.abs() / MAX_SPIN_OFFSET).min(1.0);
+        let vertical_spin_n = (cell.b.abs() / MAX_SPIN_OFFSET).min(1.0);
+        let cushion_n = (f64::from(cell.cushions) / 3.0).min(1.0);
+        let weights = &self.weights;
+        weights.speed_window * window_n + weights.dwell * dwell_n + weights.depth * depth_n
+            - weights.speed * speed_n
+            - weights.travel * travel_n
+            - weights.side_spin * side_spin_n
+            - weights.vertical_spin * vertical_spin_n
+            - weights.cushion * cushion_n
+    }
+}
+
+/// Deepest tip offset the default sweep uses; spin terms normalize
+/// against it.
+const MAX_SPIN_OFFSET: f64 = 0.85;
 
 /// Connected components (8-connectivity) of successful grid cells.
 fn successful_components(grid: &[Vec<Cell>]) -> Vec<BTreeSet<GridKey>> {
@@ -680,7 +844,7 @@ fn failure_suggestion(
                 .partial_cmp(&rhs.distance_to_target_area())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-    let best = closest.map(|cell| to_candidate(cell, 0, project(scenario, cell).ok()));
+    let best = closest.map(|cell| to_candidate(cell, 0, 0.0, project(scenario, cell).ok()));
     PositionSuggestion {
         achievable: false,
         best,
@@ -693,6 +857,7 @@ fn failure_suggestion(
 fn to_candidate(
     cell: &Cell,
     robustness: u32,
+    score: f64,
     projection: Option<ShotProjection>,
 ) -> PositionShotCandidate {
     PositionShotCandidate {
@@ -706,6 +871,9 @@ fn to_candidate(
         distance_to_target_area: cell.distance_to_target_area(),
         robustness,
         dwell: cell.dwell,
+        score,
+        cue_travel_distance: cell.travel,
+        cue_cushion_count: cell.cushions,
         potted: cell.potted,
         scratched: cell.scratched,
         projection,
@@ -738,6 +906,8 @@ mod tests {
             in_target_area: successful,
             boundary_distance: 1.0,
             dwell: 0.0,
+            travel: 0.0,
+            cushions: 0,
             secondary_contact: false,
         }
     }
@@ -827,5 +997,75 @@ mod tests {
         grid[0][0] = cell(true);
         grid[0][4] = cell(true);
         assert_eq!(successful_components(&grid).len(), 2);
+    }
+
+    fn scoring_context() -> ScoringContext {
+        ScoringContext::new(&PositionSearchConfig::default(), 2.54)
+    }
+
+    #[test]
+    fn score_rewards_wider_speed_window() {
+        let context = scoring_context();
+        let base = cell(true);
+        assert!(context.score(&base, 4) > context.score(&base, 1));
+    }
+
+    #[test]
+    fn score_penalizes_speed_travel_spin_and_cushions() {
+        let context = scoring_context();
+        let base = cell(true);
+
+        let mut faster = base.clone();
+        faster.speed = 4.0;
+        assert!(context.score(&faster, 2) < context.score(&base, 2));
+
+        let mut longer = base.clone();
+        longer.travel = 4.0;
+        assert!(context.score(&longer, 2) < context.score(&base, 2));
+
+        let mut side_spun = base.clone();
+        side_spun.a = 0.5;
+        let mut drawn = base.clone();
+        drawn.b = 0.5;
+        assert!(context.score(&side_spun, 2) < context.score(&base, 2));
+        assert!(context.score(&drawn, 2) < context.score(&base, 2));
+        // Side spin costs more than the same amount of follow/draw.
+        assert!(context.score(&side_spun, 2) < context.score(&drawn, 2));
+
+        let mut banked = base.clone();
+        banked.cushions = 3;
+        assert!(context.score(&banked, 2) < context.score(&base, 2));
+    }
+
+    #[test]
+    fn score_rewards_dwell() {
+        let context = scoring_context();
+        let base = cell(true);
+        let mut dwelling = base.clone();
+        dwelling.dwell = 0.6;
+        assert!(context.score(&dwelling, 2) > context.score(&base, 2));
+    }
+
+    #[test]
+    fn terminal_dwell_stops_at_first_exit() {
+        // Path passes through the square early, leaves, and re-enters to
+        // rest inside: only the tail after the last entry counts.
+        let square_polygon = square();
+        let path = vec![
+            Vec2::new(5.0, -10.0),
+            Vec2::new(5.0, -1.0), // outside approach
+            Vec2::new(5.0, 5.0),  // rest inside
+        ];
+        let dwell = terminal_dwell(&path, &square_polygon);
+        // Inside portion of the last segment is y in [0, 5] => length 5.
+        assert!((dwell - 5.0).abs() <= 6.0 / f64::from(DWELL_SAMPLES) * 4.0);
+        // A path that never leaves keeps accumulating across segments.
+        let staying = vec![
+            Vec2::new(1.0, 5.0),
+            Vec2::new(4.0, 5.0),
+            Vec2::new(8.0, 5.0),
+        ];
+        let staying_dwell = terminal_dwell(&staying, &square_polygon);
+        assert!((staying_dwell - 7.0).abs() <= 0.5);
     }
 }

@@ -45,3 +45,14 @@ Pocket IDs are `LeftBottom`, `LeftCenter`, `LeftTop`, `RightBottom`,
 `RightCenter`, and `RightTop` in the physics frame. The response contains the
 refined and geometric phi, cut angle, precision window, feasibility and
 verification flags, and occluding ball IDs.
+
+## Position-search response
+
+`suggest_position_shot_json` returns achievability, counts, and
+best/alternate candidates. Each candidate carries the solved strike, the
+cue resting position, `robustness` (contiguous speed steps at the same
+spin that also succeed), `dwell` (in-area length of the terminal
+approach), `cue_travel_distance`, `cue_cushion_count`, and `score` — the
+heuristic leave quality (benefits minus penalties; see `ScoringWeights`
+on the request's optional `config.scoring`). Scores are comparable only
+within a single search.

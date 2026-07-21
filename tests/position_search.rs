@@ -44,6 +44,7 @@ fn small_config() -> PositionSearchConfig {
         b_values: vec![-0.8, -0.4, 0.0, 0.4, 0.8],
         a_values: vec![0.0],
         fallback_a_values: vec![],
+        scoring: Default::default(),
     }
 }
 
