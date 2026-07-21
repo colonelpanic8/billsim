@@ -103,5 +103,8 @@ cd wasm-bindings
 wasm-pack build --target web --release
 ```
 
-The full default position search (108 cells) runs in roughly 36 ms under
-Node's WASM runtime.
+The production position search is progressive: it evaluates 918 cells with
+fine speed/follow/draw resolution and modest side spin, then adds the 612
+outer-English cells only when the first pass finds fewer than four distinct
+rail routes. Explicit `PositionSearchConfig` values remain single-pass, which
+keeps benchmarks and specialized callers predictable.

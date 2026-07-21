@@ -1,9 +1,10 @@
 # Mobile bindings
 
-The mobile boundary intentionally consists of two functions:
+The mobile boundary intentionally consists of three functions:
 
 - `simulateJson(request)`
 - `computePotAimJson(request)`
+- `suggestPositionShotJson(request)`
 
 They use the same serde contract as the Rust and Python APIs. Keeping one wire
 contract avoids maintaining separate Swift, Kotlin, Python, and TypeScript

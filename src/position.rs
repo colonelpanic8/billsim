@@ -6,7 +6,9 @@
 //! rest, suggest cue strike parameters (speed, spin, and the solved phi)
 //! that pot the ball and leave the cue ball inside the polygon.
 //!
-//! The search sweeps a (speed, side-spin, follow/draw) grid. At each grid
+//! The production search uses fine speed and follow/draw resolution with
+//! modest side spin first, then adds the two outer-English slices when that
+//! pass does not fill the result set with distinct rail routes. At each grid
 //! point the aim phi is solved with the throw/squirt-compensated pot solver
 //! and the solved strike is forward-simulated once. Successful grid points
 //! (potted in the requested pocket, no scratch, cue ball inside the
@@ -33,8 +35,10 @@ use crate::simulation::{SimulationError, simulate};
 
 /// Grid swept by [`suggest_position_shot`].
 ///
-/// `a_values` is the primary side-spin sweep (side spin off by default: it
-/// complicates execution for a human without usually helping position).
+/// Passing an explicit config performs this single configured sweep. When the
+/// config is omitted, the production search uses its progressive diversity
+/// preset instead. In this explicit config, `a_values` is the primary
+/// side-spin sweep (side spin off in [`PositionSearchConfig::default`]);
 /// `fallback_a_values` are additional side-spin slices swept only when the
 /// primary sweep pots but nothing reaches the polygon.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -78,7 +82,7 @@ impl Default for ScoringWeights {
     fn default() -> Self {
         Self {
             speed_window: 3.0,
-            dwell: 1.2,
+            dwell: 3.0,
             depth: 0.4,
             next_shot: 1.5,
             speed: 0.8,
@@ -101,6 +105,29 @@ fn linspace(start: f64, end: f64, count: usize) -> Vec<f64> {
     (0..count)
         .map(|index| start + step * index as f64)
         .collect()
+}
+
+const DISTINCT_ROUTES_BEFORE_OUTER_SPIN: usize = 4;
+const MAX_RETURNED_CANDIDATES: usize = 6;
+
+fn diversity_core_config(scoring: ScoringWeights) -> PositionSearchConfig {
+    PositionSearchConfig {
+        speed_values: linspace(0.9, 4.2, 18),
+        b_values: linspace(-0.85, 0.85, 17),
+        a_values: vec![-0.25, 0.0, 0.25],
+        fallback_a_values: Vec::new(),
+        scoring,
+    }
+}
+
+fn diversity_outer_spin_config(config: &PositionSearchConfig) -> PositionSearchConfig {
+    PositionSearchConfig {
+        speed_values: config.speed_values.clone(),
+        b_values: config.b_values.clone(),
+        a_values: vec![-0.5, 0.5],
+        fallback_a_values: Vec::new(),
+        scoring: config.scoring.clone(),
+    }
 }
 
 impl Default for PositionSearchConfig {
@@ -146,6 +173,9 @@ pub struct PositionShotCandidate {
     pub cue_travel_distance: f64,
     /// Cushions the cue ball contacts on its way to rest.
     pub cue_cushion_count: u32,
+    /// Ordered player-facing rail route with consecutive duplicate contacts
+    /// collapsed (for example `["bottom", "right_high"]`).
+    pub cue_route: Vec<String>,
     /// Target ball potted in the requested pocket.
     pub potted: bool,
     /// Cue ball pocketed.
@@ -194,8 +224,8 @@ pub struct PositionSuggestion {
     pub achievable: bool,
     /// `None` only if no grid point pots cleanly.
     pub best: Option<PositionShotCandidate>,
-    /// Up to 3 — the best cell of each distinct route (spin family +
-    /// rail sequence) other than the winner's.
+    /// Up to 5 alternatives. Distinct rail routes are selected first, then
+    /// different spin families may fill any remaining slots.
     pub alternates: Vec<PositionShotCandidate>,
     pub evaluated_count: u32,
     pub successful_count: u32,
@@ -355,8 +385,9 @@ type RankedCell = (CellRank, usize, GridKey);
 /// # Errors
 ///
 /// Returns [`PositionError::DegeneratePolygon`] when `target_area` has fewer
-/// than three vertices, or propagates an aim-solving or simulation failure
-/// encountered while evaluating the search grid.
+/// than three vertices. Invalid scenarios and geometry errors propagate, but
+/// an individual grid point that exceeds a simulation safety limit is treated
+/// as a miss so one pathological strike cannot abort the whole search.
 pub fn suggest_position_shot(
     scenario: &SimulationScenario,
     target_ball_id: BallId,
@@ -376,9 +407,31 @@ pub fn suggest_position_shot(
         return Ok(empty_suggestion());
     }
 
-    let config = config.unwrap_or_default();
-    let slices = evaluate_search_slices(scenario, target_ball_id, pocket_id, target_area, &config)?;
-    let evaluated_count = count_evaluated(&slices);
+    let use_progressive_side_spin = config.is_none();
+    let mut config = config.unwrap_or_else(|| diversity_core_config(ScoringWeights::default()));
+    let mut slices =
+        evaluate_search_slices(scenario, target_ball_id, pocket_id, target_area, &config)?;
+    let mut evaluated_count = count_evaluated(&slices);
+
+    // Speed and follow/draw need fine resolution to hit a small landing zone.
+    // Start with modest side spin, which is easier to execute, and only add
+    // the two outer-English slices when the core sweep cannot fill every
+    // result slot with geometrically distinct routes.
+    if use_progressive_side_spin
+        && distinct_successful_rail_routes(&slices) < DISTINCT_ROUTES_BEFORE_OUTER_SPIN
+    {
+        let outer_config = diversity_outer_spin_config(&config);
+        let outer_slices = evaluate_search_slices(
+            scenario,
+            target_ball_id,
+            pocket_id,
+            target_area,
+            &outer_config,
+        )?;
+        evaluated_count += count_evaluated(&outer_slices);
+        slices.extend(outer_slices);
+        config.a_values.extend(outer_config.a_values);
+    }
     let successful = successful_cells(&slices);
 
     if successful.is_empty() {
@@ -395,7 +448,7 @@ pub fn suggest_position_shot(
     let successful_count = u32::try_from(successful.len()).unwrap_or(u32::MAX);
     let best = realize_candidate(scenario, &slices, winner, &scoring_context)?;
     let mut alternates = Vec::new();
-    for &(_, slice_index, key) in alternate_entries.iter().take(3) {
+    for &(_, slice_index, key) in alternate_entries.iter().take(MAX_RETURNED_CANDIDATES - 1) {
         alternates.push(realize_candidate(
             scenario,
             &slices,
@@ -486,6 +539,16 @@ fn successful_cells(slices: &[SearchSlice]) -> Vec<CellIndex> {
         .collect()
 }
 
+fn distinct_successful_rail_routes(slices: &[SearchSlice]) -> usize {
+    slices
+        .iter()
+        .flat_map(|(_, grid)| grid.iter().flatten())
+        .filter(|cell| cell.successful())
+        .map(rail_route_signature)
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
 fn rank_cell(
     slices: &[SearchSlice],
     scoring_context: &ScoringContext,
@@ -522,7 +585,9 @@ fn ranked_alternates(
 ) -> Vec<RankedCell> {
     let winner_cell = &slices[winner.0].1[winner.1.0][winner.1.1];
     let winner_signature = route_signature(winner_cell);
-    let mut best_per_route = std::collections::BTreeMap::new();
+    let winner_rail_route = rail_route_signature(winner_cell);
+    let mut best_per_rail_route = std::collections::BTreeMap::new();
+    let mut best_per_shot = std::collections::BTreeMap::new();
     for &index in successful {
         let cell = &slices[index.0].1[index.1.0][index.1.1];
         let signature = route_signature(cell);
@@ -530,9 +595,25 @@ fn ranked_alternates(
             continue;
         }
         let candidate_rank = rank_cell(slices, scoring_context, index);
-        let entry = best_per_route
-            .entry(signature)
-            .or_insert((candidate_rank, index.0, index.1));
+        let entry =
+            best_per_shot
+                .entry(signature.clone())
+                .or_insert((candidate_rank, index.0, index.1));
+        if candidate_rank
+            .partial_cmp(&entry.0)
+            .is_some_and(std::cmp::Ordering::is_gt)
+        {
+            *entry = (candidate_rank, index.0, index.1);
+        }
+
+        let rail_route = rail_route_signature(cell);
+        if rail_route == winner_rail_route {
+            continue;
+        }
+        let entry =
+            best_per_rail_route
+                .entry(rail_route)
+                .or_insert((candidate_rank, index.0, index.1));
         if candidate_rank
             .partial_cmp(&entry.0)
             .is_some_and(std::cmp::Ordering::is_gt)
@@ -540,12 +621,44 @@ fn ranked_alternates(
             *entry = (candidate_rank, index.0, index.1);
         }
     }
-    let mut alternates: Vec<RankedCell> = best_per_route.into_values().collect();
+
+    // First spend the limited result slots on visibly different rail routes.
+    // Only then fill any vacancies with a different spin family on a route
+    // already represented.
+    let mut alternates: Vec<RankedCell> = best_per_rail_route.into_values().collect();
     alternates.sort_by(|lhs, rhs| {
         rhs.0
             .partial_cmp(&lhs.0)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    alternates.truncate(MAX_RETURNED_CANDIDATES - 1);
+
+    if alternates.len() < MAX_RETURNED_CANDIDATES - 1 {
+        let mut selected_signatures: BTreeSet<String> = alternates
+            .iter()
+            .map(|entry| {
+                let cell = &slices[entry.1].1[entry.2.0][entry.2.1];
+                route_signature(cell)
+            })
+            .collect();
+        selected_signatures.insert(winner_signature);
+        let mut remaining: Vec<RankedCell> = best_per_shot
+            .into_iter()
+            .filter_map(|(signature, entry)| {
+                (!selected_signatures.contains(&signature)).then_some(entry)
+            })
+            .collect();
+        remaining.sort_by(|lhs, rhs| {
+            rhs.0
+                .partial_cmp(&lhs.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        alternates.extend(
+            remaining
+                .into_iter()
+                .take(MAX_RETURNED_CANDIDATES - 1 - alternates.len()),
+        );
+    }
     alternates
 }
 
@@ -600,16 +713,27 @@ fn evaluate_slice(
             swept.strike.speed = speed;
             swept.strike.a = a;
             swept.strike.b = b;
-            let aim = compute_pot_aim_seeded(&swept, target_ball_id, pocket_id, seed_phi)?;
+            let aim = match compute_pot_aim_seeded(&swept, target_ball_id, pocket_id, seed_phi) {
+                Ok(aim) => aim,
+                Err(AimError::Simulation(error)) if search_limit_exceeded(&error) => {
+                    grid[speed_index][b_index] =
+                        Some(missed_cell(&swept, cue_start, polygon, a, swept.strike.phi));
+                    seed_phi = None;
+                    continue;
+                }
+                Err(error) => return Err(PositionError::Aim(error)),
+            };
             if aim.potted {
                 swept.strike.phi = aim.phi;
-                grid[speed_index][b_index] = Some(forward_simulate(
-                    &swept,
-                    target_ball_id,
-                    pocket_id,
-                    polygon,
-                    a,
-                )?);
+                grid[speed_index][b_index] = Some(
+                    match forward_simulate(&swept, target_ball_id, pocket_id, polygon, a) {
+                        Ok(cell) => cell,
+                        Err(PositionError::Simulation(error)) if search_limit_exceeded(&error) => {
+                            missed_cell(&swept, cue_start, polygon, a, aim.phi)
+                        }
+                        Err(error) => return Err(error),
+                    },
+                );
                 // Only propagate seeds that actually solved; a garbage
                 // best-effort phi would poison neighboring solves.
                 seed_phi = Some(aim.phi);
@@ -617,24 +741,8 @@ fn evaluate_slice(
                 // The aim solver's verification probe already simulated
                 // exactly this strike and it did not pot; the sim is
                 // deterministic, so re-running it cannot succeed.
-                grid[speed_index][b_index] = Some(Cell {
-                    speed,
-                    phi: aim.phi,
-                    theta: scenario.strike.theta,
-                    a,
-                    b,
-                    cue_final_position: cue_start,
-                    potted: false,
-                    scratched: false,
-                    in_target_area: false,
-                    boundary_distance: distance_to_polygon_boundary(cue_start, polygon),
-                    dwell: 0.0,
-                    travel: 0.0,
-                    cushions: 0,
-                    next_shot_quality: 0.0,
-                    route: Vec::new(),
-                    secondary_contact: false,
-                });
+                grid[speed_index][b_index] =
+                    Some(missed_cell(&swept, cue_start, polygon, a, aim.phi));
             }
         }
     }
@@ -646,6 +754,40 @@ fn evaluate_slice(
                 .collect()
         })
         .collect())
+}
+
+fn search_limit_exceeded(error: &SimulationError) -> bool {
+    matches!(
+        error,
+        SimulationError::MaxTimeExceeded | SimulationError::MaxEventsExceeded
+    )
+}
+
+fn missed_cell(
+    scenario: &SimulationScenario,
+    cue_start: Vec2,
+    polygon: &[Vec2],
+    a: f64,
+    phi: f64,
+) -> Cell {
+    Cell {
+        speed: scenario.strike.speed,
+        phi,
+        theta: scenario.strike.theta,
+        a,
+        b: scenario.strike.b,
+        cue_final_position: cue_start,
+        potted: false,
+        scratched: false,
+        in_target_area: false,
+        boundary_distance: distance_to_polygon_boundary(cue_start, polygon),
+        dwell: 0.0,
+        travel: 0.0,
+        cushions: 0,
+        next_shot_quality: 0.0,
+        route: Vec::new(),
+        secondary_contact: false,
+    }
 }
 
 /// Trajectory sampling is skipped during the sweep; only returned
@@ -777,6 +919,10 @@ fn spin_family(b: f64) -> &'static str {
 /// player would name the shot.
 fn route_signature(cell: &Cell) -> String {
     format!("{}|{}", spin_family(cell.b), cell.route.join(">"))
+}
+
+fn rail_route_signature(cell: &Cell) -> String {
+    cell.route.join(">")
 }
 
 /// A pot precision window (degrees) at least this wide counts as a fully
@@ -971,7 +1117,7 @@ fn speed_window(grid: &[Vec<Cell>], key: GridKey) -> u32 {
 struct ScoringContext {
     weights: ScoringWeights,
     max_speed: f64,
-    max_window: f64,
+    speed_step: f64,
     table_length: f64,
     /// Depth saturates at this distance from the boundary — half the
     /// zone's own scale (sqrt of area), so "centered" is relative to
@@ -981,6 +1127,18 @@ struct ScoringContext {
 
 impl ScoringContext {
     fn new(config: &PositionSearchConfig, table_length: f64, polygon: &[Vec2]) -> Self {
+        let speed_range = config
+            .speed_values
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max)
+            - config
+                .speed_values
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min);
+        #[allow(clippy::cast_precision_loss)]
+        let speed_intervals = config.speed_values.len().saturating_sub(1) as f64;
         Self {
             weights: config.scoring.clone(),
             max_speed: config
@@ -988,8 +1146,11 @@ impl ScoringContext {
                 .iter()
                 .copied()
                 .fold(f64::EPSILON, f64::max),
-            #[allow(clippy::cast_precision_loss)]
-            max_window: config.speed_values.len().max(1) as f64,
+            speed_step: if speed_intervals > 0.0 {
+                speed_range / speed_intervals
+            } else {
+                0.0
+            },
             table_length: table_length.max(f64::EPSILON),
             depth_scale: (0.5 * polygon_area(polygon).sqrt()).max(f64::EPSILON),
         }
@@ -1008,7 +1169,12 @@ impl ScoringContext {
     /// show why a leave scored the way it did. Benefits are >= 0,
     /// penalties <= 0, and `total` is their sum.
     fn breakdown(&self, cell: &Cell, window: u32) -> ScoreBreakdown {
-        let window_n = (f64::from(window) - 1.0).max(0.0) / (self.max_window - 1.0).max(1.0);
+        // Reward the physical speed interval that still works, not the
+        // fraction of the entire search grid it occupies. About 0.6 m/s of
+        // tolerance is already fully comfortable; normalizing by all 18
+        // production speeds made a valuable two-step window nearly worthless.
+        let speed_window_span = (f64::from(window) - 1.0).max(0.0) * self.speed_step;
+        let window_n = (speed_window_span / 0.6).min(1.0);
         let dwell_n = (cell.dwell / (0.5 * self.table_length)).min(1.0);
         let depth_n = if cell.in_target_area {
             (cell.boundary_distance / self.depth_scale).min(1.0)
@@ -1113,6 +1279,7 @@ fn to_candidate(
         score_breakdown: breakdown,
         cue_travel_distance: cell.travel,
         cue_cushion_count: cell.cushions,
+        cue_route: cell.route.iter().map(|rail| (*rail).to_owned()).collect(),
         potted: cell.potted,
         scratched: cell.scratched,
         projection,
@@ -1254,6 +1421,39 @@ mod tests {
     }
 
     #[test]
+    fn alternates_prioritize_distinct_rail_routes_over_spin_variants() {
+        let mut direct_stun = cell(true);
+        direct_stun.b = 0.0;
+        let mut direct_follow = cell(true);
+        direct_follow.b = 0.4;
+        let mut top = cell(true);
+        top.route = vec!["top"];
+        let mut left = cell(true);
+        left.route = vec!["left_low"];
+        let mut right = cell(true);
+        right.route = vec!["right_high"];
+        let slices = vec![(
+            0.0,
+            vec![vec![direct_stun, direct_follow, top, left, right]],
+        )];
+        let successful = successful_cells(&slices);
+        let alternates = ranked_alternates(&slices, &successful, (0, (0, 0)), &scoring_context());
+        let first_three_routes: BTreeSet<String> = alternates
+            .iter()
+            .take(3)
+            .map(|entry| rail_route_signature(&slices[entry.1].1[entry.2.0][entry.2.1]))
+            .collect();
+
+        assert_eq!(alternates.len(), 4);
+        assert_eq!(first_three_routes.len(), 3);
+        assert!(!first_three_routes.contains(""));
+        assert_eq!(
+            rail_route_signature(&slices[alternates[3].1].1[alternates[3].2.0][alternates[3].2.1]),
+            ""
+        );
+    }
+
+    #[test]
     fn rail_label_classifies_the_six_rails() {
         let table = crate::model::TableSpec::default();
         let l = table.length;
@@ -1281,6 +1481,21 @@ mod tests {
         let context = scoring_context();
         let base = cell(true);
         assert!(context.score(&base, 4) > context.score(&base, 1));
+    }
+
+    #[test]
+    fn speed_window_uses_physical_span_and_saturates_when_comfortable() {
+        let context = scoring_context();
+        let base = cell(true);
+        let one_step = context.breakdown(&base, 1).speed_window;
+        let two_steps = context.breakdown(&base, 2).speed_window;
+        let three_steps = context.breakdown(&base, 3).speed_window;
+        let four_steps = context.breakdown(&base, 4).speed_window;
+
+        assert!(one_step.abs() < f64::EPSILON);
+        assert!(two_steps > 0.0);
+        assert!((three_steps - ScoringWeights::default().speed_window).abs() < 1e-12);
+        assert!((three_steps - four_steps).abs() < f64::EPSILON);
     }
 
     #[test]

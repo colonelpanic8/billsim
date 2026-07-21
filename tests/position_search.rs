@@ -117,9 +117,10 @@ fn forward_position_finds_clean_non_draw_leave() {
     assert!(best.in_target_area);
     assert!(best.potted);
     assert!(!best.scratched);
-    // The b=0 column lands in-zone across the whole speed range here,
-    // so the winner should carry a wide speed window.
-    assert!(best.robustness >= 3);
+    // The winner should tolerate at least one adjacent sampled speed. In
+    // this deliberately sparse explicit grid, two cells already span
+    // 0.5+ m/s; ranking uses that physical span rather than raw cell count.
+    assert!(best.robustness >= 2);
     assert!(best.dwell >= 0.0);
     let projection = best.projection.expect("winner carries a projection");
     // Contact-clean: the shot's only ball-ball event is cue -> target.

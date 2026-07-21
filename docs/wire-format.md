@@ -52,7 +52,8 @@ verification flags, and occluding ball IDs.
 best/alternate candidates. Each candidate carries the solved strike, the
 cue resting position, `robustness` (contiguous speed steps at the same
 spin that also succeed), `dwell` (in-area length of the terminal
-approach), `cue_travel_distance`, `cue_cushion_count`, and `score` — the
-heuristic leave quality (benefits minus penalties; see `ScoringWeights`
-on the request's optional `config.scoring`). Scores are comparable only
-within a single search.
+approach), `cue_travel_distance`, `cue_cushion_count`, `cue_route` (ordered
+player-facing rail labels with consecutive duplicates collapsed), and
+`score` — the heuristic leave quality (benefits minus penalties; see
+`ScoringWeights` on the request's optional `config.scoring`). Scores are
+comparable only within a single search.
