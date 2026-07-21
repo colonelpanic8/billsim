@@ -137,6 +137,8 @@ pub struct PositionShotCandidate {
     /// Heuristic desirability of this leave (benefits minus penalties;
     /// see [`ScoringWeights`]). Comparable only within one search.
     pub score: f64,
+    /// The per-factor contributions summing to `score`.
+    pub score_breakdown: ScoreBreakdown,
     /// Total distance (meters) the cue ball travels before resting.
     pub cue_travel_distance: f64,
     /// Cushions the cue ball contacts on its way to rest.
@@ -147,6 +149,39 @@ pub struct PositionShotCandidate {
     pub scratched: bool,
     /// Full projection; only populated for returned candidates.
     pub projection: Option<ShotProjection>,
+}
+
+/// The per-factor contributions to a leave's [`PositionShotCandidate::score`].
+/// Benefits are non-negative, penalties non-positive; `total` is the sum
+/// and equals the candidate's `score`. `vertical_spin` is the follow- or
+/// draw-weighted contribution depending on the sign of the strike's `b`.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ScoreBreakdown {
+    pub speed_window: f64,
+    pub dwell: f64,
+    pub depth: f64,
+    pub speed: f64,
+    pub travel: f64,
+    pub side_spin: f64,
+    pub vertical_spin: f64,
+    pub cushion: f64,
+    pub total: f64,
+}
+
+impl ScoreBreakdown {
+    fn zero() -> Self {
+        Self {
+            speed_window: 0.0,
+            dwell: 0.0,
+            depth: 0.0,
+            speed: 0.0,
+            travel: 0.0,
+            side_spin: 0.0,
+            vertical_spin: 0.0,
+            cushion: 0.0,
+            total: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -446,7 +481,7 @@ pub fn suggest_position_shot(
             Ok(to_candidate(
                 cell,
                 window,
-                scoring_context.score(cell, window),
+                scoring_context.breakdown(cell, window),
                 Some(project(scenario, cell)?),
             ))
         };
@@ -767,6 +802,13 @@ impl ScoringContext {
     /// follow/draw — and cushions). Saturations: dwell at half a table
     /// length, depth at 0.3 m, travel at two table lengths, cushions at 3.
     fn score(&self, cell: &Cell, window: u32) -> f64 {
+        self.breakdown(cell, window).total
+    }
+
+    /// The signed, weighted contribution of every factor, so callers can
+    /// show why a leave scored the way it did. Benefits are >= 0,
+    /// penalties <= 0, and `total` is their sum.
+    fn breakdown(&self, cell: &Cell, window: u32) -> ScoreBreakdown {
         let window_n = (f64::from(window) - 1.0).max(0.0) / (self.max_window - 1.0).max(1.0);
         let dwell_n = (cell.dwell / (0.5 * self.table_length)).min(1.0);
         let depth_n = if cell.in_target_area {
@@ -786,12 +828,26 @@ impl ScoringContext {
         };
         let cushion_n = (f64::from(cell.cushions) / 3.0).min(1.0);
         let weights = &self.weights;
-        weights.speed_window * window_n + weights.dwell * dwell_n + weights.depth * depth_n
-            - weights.speed * speed_n
-            - weights.travel * travel_n
-            - weights.side_spin * side_spin_n
-            - vertical_weight * vertical_spin_n
-            - weights.cushion * cushion_n
+        let mut breakdown = ScoreBreakdown {
+            speed_window: weights.speed_window * window_n,
+            dwell: weights.dwell * dwell_n,
+            depth: weights.depth * depth_n,
+            speed: -weights.speed * speed_n,
+            travel: -weights.travel * travel_n,
+            side_spin: -weights.side_spin * side_spin_n,
+            vertical_spin: -vertical_weight * vertical_spin_n,
+            cushion: -weights.cushion * cushion_n,
+            total: 0.0,
+        };
+        breakdown.total = breakdown.speed_window
+            + breakdown.dwell
+            + breakdown.depth
+            + breakdown.speed
+            + breakdown.travel
+            + breakdown.side_spin
+            + breakdown.vertical_spin
+            + breakdown.cushion;
+        breakdown
     }
 }
 
@@ -858,7 +914,14 @@ fn failure_suggestion(
                 .partial_cmp(&rhs.distance_to_target_area())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-    let best = closest.map(|cell| to_candidate(cell, 0, 0.0, project(scenario, cell).ok()));
+    let best = closest.map(|cell| {
+        to_candidate(
+            cell,
+            0,
+            ScoreBreakdown::zero(),
+            project(scenario, cell).ok(),
+        )
+    });
     PositionSuggestion {
         achievable: false,
         best,
@@ -871,7 +934,7 @@ fn failure_suggestion(
 fn to_candidate(
     cell: &Cell,
     robustness: u32,
-    score: f64,
+    breakdown: ScoreBreakdown,
     projection: Option<ShotProjection>,
 ) -> PositionShotCandidate {
     PositionShotCandidate {
@@ -885,7 +948,8 @@ fn to_candidate(
         distance_to_target_area: cell.distance_to_target_area(),
         robustness,
         dwell: cell.dwell,
-        score,
+        score: breakdown.total,
+        score_breakdown: breakdown,
         cue_travel_distance: cell.travel,
         cue_cushion_count: cell.cushions,
         potted: cell.potted,
@@ -1053,6 +1117,35 @@ mod tests {
         let mut banked = base.clone();
         banked.cushions = 3;
         assert!(context.score(&banked, 2) < context.score(&base, 2));
+    }
+
+    #[test]
+    fn breakdown_sums_to_score_with_correct_signs() {
+        let context = scoring_context();
+        let mut cell = cell(true);
+        cell.speed = 3.0;
+        cell.travel = 2.0;
+        cell.a = 0.4;
+        cell.b = -0.5;
+        cell.cushions = 2;
+        cell.dwell = 0.4;
+        let breakdown = context.breakdown(&cell, 3);
+        assert!((breakdown.total - context.score(&cell, 3)).abs() < 1e-12);
+        // Benefits non-negative, penalties non-positive.
+        for benefit in [breakdown.speed_window, breakdown.dwell, breakdown.depth] {
+            assert!(benefit >= 0.0);
+        }
+        for penalty in [
+            breakdown.speed,
+            breakdown.travel,
+            breakdown.side_spin,
+            breakdown.vertical_spin,
+            breakdown.cushion,
+        ] {
+            assert!(penalty <= 0.0);
+        }
+        // b < 0 routes the vertical term through the (heavier) draw weight.
+        assert!(breakdown.vertical_spin < 0.0);
     }
 
     #[test]

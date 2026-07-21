@@ -23,8 +23,8 @@ pub use ffi::{
     suggest_position_shot_json,
 };
 pub use position::{
-    PositionError, PositionSearchConfig, PositionShotCandidate, PositionSuggestion,
-    suggest_position_shot,
+    PositionError, PositionSearchConfig, PositionShotCandidate, PositionSuggestion, ScoreBreakdown,
+    ScoringWeights, suggest_position_shot,
 };
 
 #[cfg(feature = "uniffi-bindings")]
