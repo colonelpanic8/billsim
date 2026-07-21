@@ -341,6 +341,10 @@ impl Cell {
 }
 
 type GridKey = (usize, usize);
+type SearchSlice = (f64, Vec<Vec<Cell>>);
+type CellIndex = (usize, GridKey);
+type CellRank = (f64, u32, f64);
+type RankedCell = (CellRank, usize, GridKey);
 
 /// Search for strikes that pot `target_ball_id` and leave the cue ball
 /// inside `target_area` (physics-frame meters).
@@ -350,11 +354,9 @@ type GridKey = (usize, usize);
 ///
 /// # Errors
 ///
-/// Returns [`PositionError`] for a degenerate polygon or a failed aim
-/// solve / simulation inside the sweep.
-#[allow(clippy::too_many_lines)] // The sweep/rank/select pipeline reads best unsplit.
-type RankedCell = ((f64, u32, f64), usize, GridKey);
-
+/// Returns [`PositionError::DegeneratePolygon`] when `target_area` has fewer
+/// than three vertices, or propagates an aim-solving or simulation failure
+/// encountered while evaluating the search grid.
 pub fn suggest_position_shot(
     scenario: &SimulationScenario,
     target_ball_id: BallId,
@@ -365,70 +367,19 @@ pub fn suggest_position_shot(
     if target_area.len() < 3 {
         return Err(PositionError::DegeneratePolygon);
     }
-    let config = config.unwrap_or_default();
-
     // A pot that is geometrically off (path blocked, or cut beyond the
     // playable limit) can never produce a successful cell, and sweeping it
     // anyway hits the aim solver's worst case on every cell. Bail out
     // before simulating anything.
     let feasibility = geometric_pot_feasibility(scenario, target_ball_id, pocket_id)?;
     if !feasibility.feasible {
-        return Ok(PositionSuggestion {
-            achievable: false,
-            best: None,
-            alternates: Vec::new(),
-            evaluated_count: 0,
-            successful_count: 0,
-        });
+        return Ok(empty_suggestion());
     }
 
-    let mut slices: Vec<(f64, Vec<Vec<Cell>>)> = Vec::new();
-    for &a in &config.a_values {
-        let cells = evaluate_slice(scenario, target_ball_id, pocket_id, target_area, a, &config)?;
-        slices.push((a, cells));
-    }
-
-    let any_success = |slices: &[(f64, Vec<Vec<Cell>>)]| {
-        slices
-            .iter()
-            .flat_map(|(_, grid)| grid.iter().flatten())
-            .any(Cell::successful)
-    };
-    let any_pot = |slices: &[(f64, Vec<Vec<Cell>>)]| {
-        slices
-            .iter()
-            .flat_map(|(_, grid)| grid.iter().flatten())
-            .any(|cell| cell.potted)
-    };
-
-    // Side-spin fallback only helps when the pot itself goes in but no
-    // primary-spin leave reaches the polygon.
-    if !any_success(&slices) && any_pot(&slices) {
-        for &a in &config.fallback_a_values {
-            if config.a_values.contains(&a) {
-                continue;
-            }
-            let cells =
-                evaluate_slice(scenario, target_ball_id, pocket_id, target_area, a, &config)?;
-            slices.push((a, cells));
-        }
-    }
-
-    let evaluated_count = slices
-        .iter()
-        .map(|(_, grid)| grid.iter().map(Vec::len).sum::<usize>())
-        .sum::<usize>();
-    let successful: Vec<(usize, GridKey)> = slices
-        .iter()
-        .enumerate()
-        .flat_map(|(slice_index, (_, grid))| {
-            grid.iter().enumerate().flat_map(move |(v, row)| {
-                row.iter()
-                    .enumerate()
-                    .filter_map(move |(b, cell)| cell.successful().then_some((slice_index, (v, b))))
-            })
-        })
-        .collect();
+    let config = config.unwrap_or_default();
+    let slices = evaluate_search_slices(scenario, target_ball_id, pocket_id, target_area, &config)?;
+    let evaluated_count = count_evaluated(&slices);
+    let successful = successful_cells(&slices);
 
     if successful.is_empty() {
         return Ok(failure_suggestion(
@@ -438,84 +389,19 @@ pub fn suggest_position_shot(
         ));
     }
 
-    // Rank every successful cell by its heuristic leave score (see
-    // ScoringWeights); the speed window feeds the score as its dominant
-    // benefit. Ties break on (window, dwell) for determinism.
     let scoring_context = ScoringContext::new(&config, scenario.table.length, target_area);
-    let rank = |slice_index: usize, key: GridKey| -> (f64, u32, f64) {
-        let grid = &slices[slice_index].1;
-        let cell = &grid[key.0][key.1];
-        let window = speed_window(grid, key);
-        (scoring_context.score(cell, window), window, cell.dwell)
-    };
-    let better = |lhs: (f64, u32, f64), rhs: (f64, u32, f64)| -> bool {
-        lhs.partial_cmp(&rhs) == Some(std::cmp::Ordering::Greater)
-    };
-
-    let mut winner = successful[0];
-    let mut winner_rank = rank(winner.0, winner.1);
-    for &(slice_index, key) in &successful[1..] {
-        let candidate_rank = rank(slice_index, key);
-        if better(candidate_rank, winner_rank) {
-            winner = (slice_index, key);
-            winner_rank = candidate_rank;
-        }
-    }
-
-    // Alternates are genuinely different *shots*: distinct route
-    // signatures (spin family + the ordered rails the cue ball takes),
-    // the winner's excluded. Parameter-space adjacency is not shot
-    // identity — the success region is usually one connected blob — so
-    // grouping by route is what surfaces "the follow route vs the
-    // two-rail draw route" as real options.
-    let winner_signature = {
-        let grid = &slices[winner.0].1;
-        route_signature(&grid[winner.1.0][winner.1.1])
-    };
-    let mut best_per_route: std::collections::BTreeMap<String, RankedCell> =
-        std::collections::BTreeMap::new();
-    for &(slice_index, key) in &successful {
-        let cell = &slices[slice_index].1[key.0][key.1];
-        let signature = route_signature(cell);
-        if signature == winner_signature {
-            continue;
-        }
-        let candidate_rank = rank(slice_index, key);
-        let entry = best_per_route
-            .entry(signature)
-            .or_insert((candidate_rank, slice_index, key));
-        if candidate_rank
-            .partial_cmp(&entry.0)
-            .is_some_and(std::cmp::Ordering::is_gt)
-        {
-            *entry = (candidate_rank, slice_index, key);
-        }
-    }
-    let mut alternate_entries: Vec<RankedCell> = best_per_route.into_values().collect();
-    alternate_entries.sort_by(|lhs, rhs| {
-        rhs.0
-            .partial_cmp(&lhs.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
+    let winner = best_cell(&slices, &successful, &scoring_context);
+    let alternate_entries = ranked_alternates(&slices, &successful, winner, &scoring_context);
     let successful_count = u32::try_from(successful.len()).unwrap_or(u32::MAX);
-    let realize =
-        |slice_index: usize, key: GridKey| -> Result<PositionShotCandidate, PositionError> {
-            let grid = &slices[slice_index].1;
-            let cell = &grid[key.0][key.1];
-            let window = speed_window(grid, key);
-            Ok(to_candidate(
-                cell,
-                window,
-                scoring_context.breakdown(cell, window),
-                Some(project(scenario, cell)?),
-            ))
-        };
-
-    let best = realize(winner.0, winner.1)?;
+    let best = realize_candidate(scenario, &slices, winner, &scoring_context)?;
     let mut alternates = Vec::new();
     for &(_, slice_index, key) in alternate_entries.iter().take(3) {
-        alternates.push(realize(slice_index, key)?);
+        alternates.push(realize_candidate(
+            scenario,
+            &slices,
+            (slice_index, key),
+            &scoring_context,
+        )?);
     }
 
     Ok(PositionSuggestion {
@@ -525,6 +411,159 @@ pub fn suggest_position_shot(
         evaluated_count: u32::try_from(evaluated_count).unwrap_or(u32::MAX),
         successful_count,
     })
+}
+
+fn empty_suggestion() -> PositionSuggestion {
+    PositionSuggestion {
+        achievable: false,
+        best: None,
+        alternates: Vec::new(),
+        evaluated_count: 0,
+        successful_count: 0,
+    }
+}
+
+fn evaluate_search_slices(
+    scenario: &SimulationScenario,
+    target_ball_id: BallId,
+    pocket_id: PocketId,
+    target_area: &[Vec2],
+    config: &PositionSearchConfig,
+) -> Result<Vec<SearchSlice>, PositionError> {
+    let mut slices = Vec::new();
+    for &a in &config.a_values {
+        let cells = evaluate_slice(scenario, target_ball_id, pocket_id, target_area, a, config)?;
+        slices.push((a, cells));
+    }
+
+    // Side-spin fallback only helps when the pot itself goes in but no
+    // primary-spin leave reaches the polygon.
+    if !slices_have_success(&slices) && slices_have_pot(&slices) {
+        for &a in &config.fallback_a_values {
+            if config.a_values.contains(&a) {
+                continue;
+            }
+            let cells =
+                evaluate_slice(scenario, target_ball_id, pocket_id, target_area, a, config)?;
+            slices.push((a, cells));
+        }
+    }
+    Ok(slices)
+}
+
+fn slices_have_success(slices: &[SearchSlice]) -> bool {
+    slices
+        .iter()
+        .flat_map(|(_, grid)| grid.iter().flatten())
+        .any(Cell::successful)
+}
+
+fn slices_have_pot(slices: &[SearchSlice]) -> bool {
+    slices
+        .iter()
+        .flat_map(|(_, grid)| grid.iter().flatten())
+        .any(|cell| cell.potted)
+}
+
+fn count_evaluated(slices: &[SearchSlice]) -> usize {
+    slices
+        .iter()
+        .map(|(_, grid)| grid.iter().map(Vec::len).sum::<usize>())
+        .sum()
+}
+
+fn successful_cells(slices: &[SearchSlice]) -> Vec<CellIndex> {
+    slices
+        .iter()
+        .enumerate()
+        .flat_map(|(slice_index, (_, grid))| {
+            grid.iter().enumerate().flat_map(move |(speed, row)| {
+                row.iter().enumerate().filter_map(move |(spin, cell)| {
+                    cell.successful().then_some((slice_index, (speed, spin)))
+                })
+            })
+        })
+        .collect()
+}
+
+fn rank_cell(
+    slices: &[SearchSlice],
+    scoring_context: &ScoringContext,
+    index: CellIndex,
+) -> CellRank {
+    let grid = &slices[index.0].1;
+    let cell = &grid[index.1.0][index.1.1];
+    let window = speed_window(grid, index.1);
+    (scoring_context.score(cell, window), window, cell.dwell)
+}
+
+fn best_cell(
+    slices: &[SearchSlice],
+    successful: &[CellIndex],
+    scoring_context: &ScoringContext,
+) -> CellIndex {
+    let mut winner = successful[0];
+    let mut winner_rank = rank_cell(slices, scoring_context, winner);
+    for &candidate in &successful[1..] {
+        let candidate_rank = rank_cell(slices, scoring_context, candidate);
+        if candidate_rank.partial_cmp(&winner_rank) == Some(std::cmp::Ordering::Greater) {
+            winner = candidate;
+            winner_rank = candidate_rank;
+        }
+    }
+    winner
+}
+
+fn ranked_alternates(
+    slices: &[SearchSlice],
+    successful: &[CellIndex],
+    winner: CellIndex,
+    scoring_context: &ScoringContext,
+) -> Vec<RankedCell> {
+    let winner_cell = &slices[winner.0].1[winner.1.0][winner.1.1];
+    let winner_signature = route_signature(winner_cell);
+    let mut best_per_route = std::collections::BTreeMap::new();
+    for &index in successful {
+        let cell = &slices[index.0].1[index.1.0][index.1.1];
+        let signature = route_signature(cell);
+        if signature == winner_signature {
+            continue;
+        }
+        let candidate_rank = rank_cell(slices, scoring_context, index);
+        let entry = best_per_route
+            .entry(signature)
+            .or_insert((candidate_rank, index.0, index.1));
+        if candidate_rank
+            .partial_cmp(&entry.0)
+            .is_some_and(std::cmp::Ordering::is_gt)
+        {
+            *entry = (candidate_rank, index.0, index.1);
+        }
+    }
+    let mut alternates: Vec<RankedCell> = best_per_route.into_values().collect();
+    alternates.sort_by(|lhs, rhs| {
+        rhs.0
+            .partial_cmp(&lhs.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    alternates
+}
+
+fn realize_candidate(
+    scenario: &SimulationScenario,
+    slices: &[SearchSlice],
+    index: CellIndex,
+    scoring_context: &ScoringContext,
+) -> Result<PositionShotCandidate, PositionError> {
+    let grid = &slices[index.0].1;
+    let cell = &grid[index.1.0][index.1.1];
+    let window = speed_window(grid, index.1);
+    Ok(to_candidate(
+        cell,
+        window,
+        scoring_context.breakdown(cell, window),
+        Some(project(scenario, cell)?),
+    ))
 }
 
 /// Solve + forward-simulate every (speed, b) grid point at side spin `a`.

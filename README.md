@@ -40,6 +40,11 @@ cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+On NixOS or any system with Nix flakes enabled, `nix develop` provides the
+Rust toolchain plus the Python/Maturin, WebAssembly, and Android `cargo-ndk`
+development tools. The Android NDK itself must still be installed separately
+and exposed through `ANDROID_NDK_HOME` for native Android builds.
+
 The primary APIs are `simulate`, `compute_pot_aim`, and
 `suggest_position_shot`. `simulate_json`, `compute_pot_aim_json`, and
 `suggest_position_shot_json` expose the same types as JSON for language

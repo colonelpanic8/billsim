@@ -121,10 +121,7 @@ pub fn simulate(
     let mut snapshots = vec![snapshot(elapsed, &balls)];
     let mut potted_ball_ids = Vec::new();
 
-    loop {
-        let Some((duration, pending)) = next_event(&balls, &geometry, params) else {
-            break;
-        };
+    while let Some((duration, pending)) = next_event(&balls, &geometry, params) {
         if events.len() >= options.max_events {
             return Err(SimulationError::MaxEventsExceeded);
         }
