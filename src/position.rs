@@ -24,6 +24,7 @@ use std::collections::{BTreeSet, VecDeque};
 use serde::{Deserialize, Serialize};
 
 use crate::aiming::{AimError, compute_pot_aim_seeded, geometric_pot_feasibility};
+
 use crate::math::Vec2;
 use crate::model::{
     BallId, PocketId, ShotProjection, SimulationEventType, SimulationOptions, SimulationScenario,
@@ -64,6 +65,7 @@ pub struct ScoringWeights {
     pub speed_window: f64,
     pub dwell: f64,
     pub depth: f64,
+    pub next_shot: f64,
     pub speed: f64,
     pub travel: f64,
     pub side_spin: f64,
@@ -78,6 +80,7 @@ impl Default for ScoringWeights {
             speed_window: 3.0,
             dwell: 1.2,
             depth: 0.4,
+            next_shot: 1.5,
             speed: 0.8,
             travel: 0.7,
             side_spin: 0.7,
@@ -160,6 +163,7 @@ pub struct ScoreBreakdown {
     pub speed_window: f64,
     pub dwell: f64,
     pub depth: f64,
+    pub next_shot: f64,
     pub speed: f64,
     pub travel: f64,
     pub side_spin: f64,
@@ -174,6 +178,7 @@ impl ScoreBreakdown {
             speed_window: 0.0,
             dwell: 0.0,
             depth: 0.0,
+            next_shot: 0.0,
             speed: 0.0,
             travel: 0.0,
             side_spin: 0.0,
@@ -308,6 +313,10 @@ struct Cell {
     dwell: f64,
     travel: f64,
     cushions: u32,
+    /// Quality (0..1) of the best remaining pot from the landing spot —
+    /// geometry of the post-shot layout, which is exactly known because
+    /// contact-clean shots move nothing but the target.
+    next_shot_quality: f64,
     /// Any ball-ball contact beyond the single cue -> target hit.
     secondary_contact: bool,
 }
@@ -425,7 +434,7 @@ pub fn suggest_position_shot(
     // Rank every successful cell by its heuristic leave score (see
     // ScoringWeights); the speed window feeds the score as its dominant
     // benefit. Ties break on (window, dwell) for determinism.
-    let scoring_context = ScoringContext::new(&config, scenario.table.length);
+    let scoring_context = ScoringContext::new(&config, scenario.table.length, target_area);
     let rank = |slice_index: usize, key: GridKey| -> (f64, u32, f64) {
         let grid = &slices[slice_index].1;
         let cell = &grid[key.0][key.1];
@@ -566,6 +575,7 @@ fn evaluate_slice(
                     dwell: 0.0,
                     travel: 0.0,
                     cushions: 0,
+                    next_shot_quality: 0.0,
                     secondary_contact: false,
                 });
             }
@@ -605,6 +615,15 @@ fn forward_simulate(
         .map(|state| state.position)
         .unwrap_or_default();
     let in_target_area = point_in_polygon(cue_final, polygon);
+    let potted = potted_in_pocket(&projection, target_ball_id, pocket_id);
+    let scratched = ball_pocketed(&projection, scenario.cue_ball_id);
+    let clean = sole_contact_is_cue_target(&projection, scenario.cue_ball_id, target_ball_id);
+    // Only cells that can rank need the next-shot geometry.
+    let next_shot_quality = if in_target_area && potted && !scratched && clean {
+        best_next_shot_quality(scenario, target_ball_id, cue_final)
+    } else {
+        0.0
+    };
     let path = cue_path(&projection, scenario, cue_final);
     let travel = path
         .windows(2)
@@ -628,19 +647,74 @@ fn forward_simulate(
         a,
         b: scenario.strike.b,
         cue_final_position: cue_final,
-        potted: potted_in_pocket(&projection, target_ball_id, pocket_id),
-        scratched: ball_pocketed(&projection, scenario.cue_ball_id),
+        potted,
+        scratched,
         in_target_area,
         boundary_distance: distance_to_polygon_boundary(cue_final, polygon),
         dwell: terminal_dwell(&path, polygon),
         travel,
         cushions,
-        secondary_contact: !sole_contact_is_cue_target(
-            &projection,
-            scenario.cue_ball_id,
-            target_ball_id,
-        ),
+        next_shot_quality,
+        secondary_contact: !clean,
     })
+}
+
+/// A pot precision window (degrees) at least this wide counts as a fully
+/// comfortable next shot.
+const NEXT_SHOT_FULL_PRECISION: f64 = 6.0;
+
+/// Quality (0..1) of the best remaining pot from `cue_final` after the
+/// target drops. Contact-clean shots move nothing but the target, so the
+/// post-shot layout is exact: the original balls minus the target, with
+/// the cue at its landing spot. Pure geometry — no simulations.
+fn best_next_shot_quality(
+    scenario: &SimulationScenario,
+    potted_target_id: BallId,
+    cue_final: Vec2,
+) -> f64 {
+    let mut after = scenario.clone();
+    after.balls.retain(|ball| ball.id != potted_target_id);
+    if let Some(cue) = after
+        .balls
+        .iter_mut()
+        .find(|ball| ball.id == after.cue_ball_id)
+    {
+        cue.position = cue_final;
+    }
+    let mut best = 0.0_f64;
+    for ball in &after.balls {
+        if ball.id == after.cue_ball_id {
+            continue;
+        }
+        for pocket in [
+            PocketId::LeftBottom,
+            PocketId::LeftCenter,
+            PocketId::LeftTop,
+            PocketId::RightBottom,
+            PocketId::RightCenter,
+            PocketId::RightTop,
+        ] {
+            if let Ok(feasibility) = geometric_pot_feasibility(&after, ball.id, pocket)
+                && feasibility.feasible
+            {
+                best =
+                    best.max((feasibility.required_precision / NEXT_SHOT_FULL_PRECISION).min(1.0));
+            }
+        }
+    }
+    best
+}
+
+/// Polygon area via the shoelace formula (absolute value).
+fn polygon_area(polygon: &[Vec2]) -> f64 {
+    let count = polygon.len();
+    let mut twice_area = 0.0;
+    for index in 0..count {
+        let a = polygon[index];
+        let b = polygon[(index + 1) % count];
+        twice_area += a.x * b.y - b.x * a.y;
+    }
+    (twice_area / 2.0).abs()
 }
 
 /// The cue ball's path as a polyline: its start position, its position at
@@ -779,10 +853,14 @@ struct ScoringContext {
     max_speed: f64,
     max_window: f64,
     table_length: f64,
+    /// Depth saturates at this distance from the boundary — half the
+    /// zone's own scale (sqrt of area), so "centered" is relative to
+    /// what the user drew rather than a fixed absolute margin.
+    depth_scale: f64,
 }
 
 impl ScoringContext {
-    fn new(config: &PositionSearchConfig, table_length: f64) -> Self {
+    fn new(config: &PositionSearchConfig, table_length: f64, polygon: &[Vec2]) -> Self {
         Self {
             weights: config.scoring.clone(),
             max_speed: config
@@ -793,6 +871,7 @@ impl ScoringContext {
             #[allow(clippy::cast_precision_loss)]
             max_window: config.speed_values.len().max(1) as f64,
             table_length: table_length.max(f64::EPSILON),
+            depth_scale: (0.5 * polygon_area(polygon).sqrt()).max(f64::EPSILON),
         }
     }
 
@@ -812,7 +891,7 @@ impl ScoringContext {
         let window_n = (f64::from(window) - 1.0).max(0.0) / (self.max_window - 1.0).max(1.0);
         let dwell_n = (cell.dwell / (0.5 * self.table_length)).min(1.0);
         let depth_n = if cell.in_target_area {
-            (cell.boundary_distance / 0.3).min(1.0)
+            (cell.boundary_distance / self.depth_scale).min(1.0)
         } else {
             0.0
         };
@@ -832,6 +911,7 @@ impl ScoringContext {
             speed_window: weights.speed_window * window_n,
             dwell: weights.dwell * dwell_n,
             depth: weights.depth * depth_n,
+            next_shot: weights.next_shot * cell.next_shot_quality.clamp(0.0, 1.0),
             speed: -weights.speed * speed_n,
             travel: -weights.travel * travel_n,
             side_spin: -weights.side_spin * side_spin_n,
@@ -842,6 +922,7 @@ impl ScoringContext {
         breakdown.total = breakdown.speed_window
             + breakdown.dwell
             + breakdown.depth
+            + breakdown.next_shot
             + breakdown.speed
             + breakdown.travel
             + breakdown.side_spin
@@ -986,6 +1067,7 @@ mod tests {
             dwell: 0.0,
             travel: 0.0,
             cushions: 0,
+            next_shot_quality: 0.0,
             secondary_contact: false,
         }
     }
@@ -1078,7 +1160,7 @@ mod tests {
     }
 
     fn scoring_context() -> ScoringContext {
-        ScoringContext::new(&PositionSearchConfig::default(), 2.54)
+        ScoringContext::new(&PositionSearchConfig::default(), 2.54, &square())
     }
 
     #[test]
@@ -1132,7 +1214,12 @@ mod tests {
         let breakdown = context.breakdown(&cell, 3);
         assert!((breakdown.total - context.score(&cell, 3)).abs() < 1e-12);
         // Benefits non-negative, penalties non-positive.
-        for benefit in [breakdown.speed_window, breakdown.dwell, breakdown.depth] {
+        for benefit in [
+            breakdown.speed_window,
+            breakdown.dwell,
+            breakdown.depth,
+            breakdown.next_shot,
+        ] {
             assert!(benefit >= 0.0);
         }
         for penalty in [
@@ -1146,6 +1233,20 @@ mod tests {
         }
         // b < 0 routes the vertical term through the (heavier) draw weight.
         assert!(breakdown.vertical_spin < 0.0);
+    }
+
+    #[test]
+    fn score_rewards_open_next_shot() {
+        let context = scoring_context();
+        let base = cell(true);
+        let mut open_next = base.clone();
+        open_next.next_shot_quality = 1.0;
+        assert!(context.score(&open_next, 2) > context.score(&base, 2));
+    }
+
+    #[test]
+    fn polygon_area_shoelace() {
+        assert!((polygon_area(&square()) - 100.0).abs() < 1e-9);
     }
 
     #[test]

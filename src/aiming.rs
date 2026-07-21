@@ -83,6 +83,9 @@ pub struct PotFeasibility {
     pub feasible: bool,
     pub occluding_ball_ids: Vec<BallId>,
     pub cut_angle: f64,
+    /// Width of the phi window that still pots (degrees) — the
+    /// geometric difficulty of the pot; larger is easier.
+    pub required_precision: f64,
 }
 
 /// Report whether a direct pot is geometrically on, using no simulations.
@@ -100,6 +103,7 @@ pub fn geometric_pot_feasibility(
         feasible: setup.feasible,
         occluding_ball_ids: setup.occluding_ball_ids,
         cut_angle: setup.cut_angle,
+        required_precision: setup.required_precision,
     })
 }
 
