@@ -7,6 +7,7 @@ use crate::aiming::{PotAim, compute_pot_aim};
 use crate::math::Vec2;
 use crate::model::{BallId, PocketId, ShotProjection, SimulationOptions, SimulationScenario};
 use crate::position::{PositionSearchConfig, PositionSuggestion, suggest_position_shot};
+use crate::scenario::{ScenarioCase, ScenarioReport, evaluate_scenario};
 use crate::simulation::simulate;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -106,12 +107,32 @@ pub fn suggest_position_shot_json(request: String) -> Result<String, FfiError> {
         .map_err(|error| FfiError::ResponseEncoding(error.to_string()))
 }
 
+/// Grade a scenario test case through the cross-language JSON contract:
+/// run its position search and match the result against its expectations.
+///
+/// # Errors
+///
+/// Returns [`FfiError`] when the request cannot be decoded, the search
+/// fails, or the response cannot be encoded. Expectation mismatches are
+/// not errors; they are reported in the returned [`ScenarioReport`].
+#[cfg_attr(feature = "uniffi-bindings", uniffi::export)]
+#[allow(clippy::needless_pass_by_value)] // UniFFI owns exported strings.
+pub fn evaluate_scenario_json(case: String) -> Result<String, FfiError> {
+    let case: ScenarioCase =
+        serde_json::from_str(&case).map_err(|error| FfiError::InvalidRequest(error.to_string()))?;
+    let report: ScenarioReport =
+        evaluate_scenario(&case).map_err(|error| FfiError::Aim(error.to_string()))?;
+    serde_json::to_string(&report).map_err(|error| FfiError::ResponseEncoding(error.to_string()))
+}
+
 #[cfg(feature = "python")]
 mod python {
     use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
 
-    use super::{compute_pot_aim_json, simulate_json, suggest_position_shot_json};
+    use super::{
+        compute_pot_aim_json, evaluate_scenario_json, simulate_json, suggest_position_shot_json,
+    };
 
     #[pyfunction(name = "simulate_json")]
     fn py_simulate_json(request: String) -> PyResult<String> {
@@ -129,11 +150,17 @@ mod python {
         compute_pot_aim_json(request).map_err(|error| PyValueError::new_err(error.to_string()))
     }
 
+    #[pyfunction(name = "evaluate_scenario_json")]
+    fn py_evaluate_scenario_json(case: String) -> PyResult<String> {
+        evaluate_scenario_json(case).map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
     #[pymodule]
     fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.add_function(wrap_pyfunction!(py_simulate_json, module)?)?;
         module.add_function(wrap_pyfunction!(py_compute_pot_aim_json, module)?)?;
         module.add_function(wrap_pyfunction!(py_suggest_position_shot_json, module)?)?;
+        module.add_function(wrap_pyfunction!(py_evaluate_scenario_json, module)?)?;
         Ok(())
     }
 }

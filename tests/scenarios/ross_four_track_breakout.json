@@ -1,0 +1,33 @@
+{
+	"name": "ross_four_track_breakout",
+	"description": "Cut the 7 into the near corner and choose among four documented cue-ball tracks to a breakout zone at the far end of the table.",
+	"source": "Tom Ross, Position Play, Billiards Digest (2002)",
+	"request": {
+		"scenario": {
+			"balls": [
+				{ "id": 0, "position": { "x": 0.53, "y": 0.27 } },
+				{ "id": 7, "position": { "x": 0.3175, "y": 0.0413 } }
+			],
+			"cue_ball_id": 0,
+			"strike": { "speed": 1.0, "phi": 0.0, "theta": 0.0, "a": 0.0, "b": 0.0 },
+			"table": {}
+		},
+		"target_ball_id": 7,
+		"pocket_id": "LeftBottom",
+		"target_area": [
+			{ "x": 1.08, "y": 1.745 },
+			{ "x": 1.24, "y": 1.745 },
+			{ "x": 1.24, "y": 2.065 },
+			{ "x": 1.08, "y": 2.065 }
+		]
+	},
+	"expect": {
+		"achievable": true,
+		"shots": [
+			{ "label": "direct short rail", "route": ["bottom"] },
+			{ "label": "short-short", "route": ["bottom", "top"] },
+			{ "label": "short-long", "route": ["bottom", "right"] },
+			{ "label": "short-long-short", "route": ["bottom", "left", "top"] }
+		]
+	}
+}

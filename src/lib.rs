@@ -11,6 +11,7 @@ pub mod math;
 pub mod model;
 pub mod physics;
 pub mod position;
+pub mod scenario;
 pub mod simulation;
 mod table;
 
@@ -19,12 +20,16 @@ pub use aiming::{
     geometric_pot_feasibility,
 };
 pub use ffi::{
-    AimRequest, FfiError, PositionRequest, SimulationRequest, compute_pot_aim_json, simulate_json,
-    suggest_position_shot_json,
+    AimRequest, FfiError, PositionRequest, SimulationRequest, compute_pot_aim_json,
+    evaluate_scenario_json, simulate_json, suggest_position_shot_json,
 };
 pub use position::{
     PositionError, PositionSearchConfig, PositionShotCandidate, PositionSuggestion, ScoreBreakdown,
     ScoringWeights, suggest_position_shot,
+};
+pub use scenario::{
+    ExpectedShot, ExpectedShotOutcome, ScenarioCase, ScenarioExpectations, ScenarioReport,
+    ShotTolerances, evaluate_scenario,
 };
 
 #[cfg(feature = "uniffi-bindings")]

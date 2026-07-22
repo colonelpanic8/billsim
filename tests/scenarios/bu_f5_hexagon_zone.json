@@ -1,0 +1,33 @@
+{
+	"name": "bu_f5_hexagon_zone",
+	"description": "The second BU F5 position zone drawn as a hexagon instead of a rectangle, exercising non-rectangular target polygons end to end.",
+	"source": "Billiard University Exam I - Fundamentals, drill F5 (adapted)",
+	"request": {
+		"scenario": {
+			"balls": [
+				{ "id": 0, "position": { "x": 0.45, "y": 1.15 } },
+				{ "id": 1, "position": { "x": 0.69215, "y": 1.27 } }
+			],
+			"cue_ball_id": 0,
+			"strike": { "speed": 1.0, "phi": 0.0, "theta": 0.0, "a": 0.0, "b": 0.0 },
+			"table": {}
+		},
+		"target_ball_id": 1,
+		"pocket_id": "RightCenter",
+		"target_area": [
+			{ "x": 0.795, "y": 1.905 },
+			{ "x": 0.715, "y": 2.0436 },
+			{ "x": 0.555, "y": 2.0436 },
+			{ "x": 0.475, "y": 1.905 },
+			{ "x": 0.555, "y": 1.7664 },
+			{ "x": 0.715, "y": 1.7664 }
+		]
+	},
+	"expect": {
+		"achievable": true,
+		"shots": [
+			{ "label": "direct", "route": [] },
+			{ "label": "end-rail rebound", "route": ["top"] }
+		]
+	}
+}

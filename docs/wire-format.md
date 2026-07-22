@@ -57,3 +57,11 @@ player-facing rail labels with consecutive duplicates collapsed), and
 `score` — the heuristic leave quality (benefits minus penalties; see
 `ScoringWeights` on the request's optional `config.scoring`). Scores are
 comparable only within a single search.
+
+## Scenario evaluation request
+
+`evaluate_scenario_json` takes a scenario test case — a `PositionRequest`
+under `request` plus fuzzy expectations under `expect` — runs the position
+search, and returns a `ScenarioReport` grading the result. The case and
+report schemas are documented in `scenario-format.md`; the same files live
+in `tests/scenarios/` and run under `cargo test`.

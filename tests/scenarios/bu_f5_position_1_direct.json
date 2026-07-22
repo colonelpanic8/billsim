@@ -1,0 +1,28 @@
+{
+	"name": "bu_f5_position_1_direct",
+	"description": "Pot the 1 in the right side pocket and hold the cue ball for the first BU F5 position zone with a direct (no-cushion) leave.",
+	"source": "Billiard University Exam I - Fundamentals, drill F5",
+	"request": {
+		"scenario": {
+			"balls": [
+				{ "id": 0, "position": { "x": 0.45, "y": 1.15 } },
+				{ "id": 1, "position": { "x": 0.69215, "y": 1.27 } }
+			],
+			"cue_ball_id": 0,
+			"strike": { "speed": 1.0, "phi": 0.0, "theta": 0.0, "a": 0.0, "b": 0.0 },
+			"table": {}
+		},
+		"target_ball_id": 1,
+		"pocket_id": "RightCenter",
+		"target_area": [
+			{ "x": 0.527, "y": 1.448 },
+			{ "x": 0.743, "y": 1.448 },
+			{ "x": 0.743, "y": 1.727 },
+			{ "x": 0.527, "y": 1.727 }
+		]
+	},
+	"expect": {
+		"achievable": true,
+		"shots": [{ "label": "direct", "route": [] }]
+	}
+}

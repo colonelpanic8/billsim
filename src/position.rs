@@ -902,7 +902,7 @@ fn rail_label(position: Vec2, table: &crate::model::TableSpec) -> &'static str {
 }
 
 /// Spin family in player terms; thresholds match the client's labels.
-fn spin_family(b: f64) -> &'static str {
+pub(crate) fn spin_family(b: f64) -> &'static str {
     if b > 0.08 {
         "follow"
     } else if b < -0.08 {
